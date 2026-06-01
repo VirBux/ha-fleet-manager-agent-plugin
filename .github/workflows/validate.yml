@@ -1,0 +1,72 @@
+name: Validate & Release
+
+# Läuft im gespiegelten Repo (VirBux/ha-fleet-manager-agent-plugin).
+# Im Monorepo liegt diese Datei unter ha-plugin/.github/ und wird dort NICHT
+# als Workflow erkannt — sie wird nur Teil des Subtree-Mirrors und läuft erst
+# im öffentlichen Plugin-Repo (dort als /.github/workflows/validate.yml).
+#
+# Der Mirror (mirror-plugin.yml im Monorepo) pusht bei jedem main-Merge den
+# ha-plugin/-Stand hierher. Dieser Push triggert:
+#   1. HACS + Hassfest (Validierung)
+#   2. release (nur bei grüner Validierung): legt automatisch ein GitHub-Release
+#      an, sobald die `version` in manifest.json einen noch nicht getaggten Wert
+#      hat — damit HACS-Nutzer das Update sehen.
+
+on:
+  push:
+    # Nur Branch-Pushes (z.B. der Mirror auf main). Tag-Pushes ignorieren, damit
+    # das vom release-Job erzeugte Tag keinen weiteren Lauf auslöst.
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Täglich, fängt neue HACS-/hassfest-Anforderungen auf.
+    - cron: "0 4 * * *"
+
+jobs:
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    name: Hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Hassfest validation
+        uses: home-assistant/actions/hassfest@master
+
+  release:
+    name: Release on version bump
+    needs: [hacs, hassfest]
+    # Nur bei echtem main-Push (nicht PR / schedule / dispatch / Tag) und nur
+    # wenn HACS + Hassfest grün sind — so entsteht nie ein Release von Code,
+    # der die Validierung nicht besteht.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Release anlegen, falls die manifest-version noch kein Tag hat
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(jq -r .version custom_components/ha_fleet_agent/manifest.json)
+          TAG="v${VERSION}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Keine version im manifest.json gefunden — abbrechen."
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG existiert bereits — nichts zu tun."
+          else
+            echo "Neue Version $VERSION → Release $TAG anlegen."
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          fi
