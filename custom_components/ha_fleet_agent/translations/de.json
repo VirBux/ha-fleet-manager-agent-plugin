@@ -1,0 +1,52 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Fleet Agent einrichten",
+        "description": "Gib den API-Key und die Basis-Domain ein. Den API-Key erhältst du im Fleet Manager Dashboard unter Einstellungen → Agenten.",
+        "data": {
+          "api_key": "API-Key",
+          "base_domain": "Basis-Domain"
+        },
+        "data_description": {
+          "api_key": "Mindestens 16 Zeichen langer Schlüssel aus dem Fleet Manager Dashboard.",
+          "base_domain": "Deine HA-Fleet-Manager-Domain, z.B. 'ha-fleet-manager.com'. Backend- und Relay-URL werden automatisch abgeleitet."
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key": "Der API-Key muss mindestens 16 Zeichen lang sein.",
+      "invalid_base_domain": "Die Domain muss mindestens einen Punkt enthalten und darf keine Leerzeichen haben (z.B. ha-fleet-manager.com)."
+    },
+    "abort": {
+      "already_configured": "HA Fleet Agent ist bereits eingerichtet."
+    }
+  },
+  "issues": {
+    "connection_request": {
+      "title": "Fernzugriff-Anfrage: {subject}",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Fernzugriff-Anfrage prüfen",
+            "description": "Deine Wartungsfirma möchte einen Fernzugriff auf dein Home Assistant aufbauen.\n\n**Betreff:** {subject}\n\n**Anfragegrund:** {reason}\n\n**Gewünschte Dauer:** {requested_hours} h\n\nWas möchtest du tun?",
+            "menu_options": {
+              "accept": "Annehmen",
+              "reject": "Ablehnen"
+            }
+          },
+          "accept": {
+            "title": "Anfrage annehmen",
+            "description": "Du kannst die Dauer der Wartungssession anpassen (max. 12 h).\n\n**Betreff:** {subject}\n**Vorgeschlagen:** {requested_hours} h",
+            "data": {
+              "duration_hours": "Dauer in Stunden"
+            }
+          }
+        },
+        "abort": {
+          "already_resolved": "Diese Anfrage wurde bereits beantwortet."
+        }
+      }
+    }
+  }
+}

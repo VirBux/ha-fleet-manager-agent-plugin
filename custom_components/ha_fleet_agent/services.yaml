@@ -1,0 +1,72 @@
+grant_pre_authorization:
+  name: Vorab-Freigabe erteilen
+  description: >-
+    Erteilt eine zeitlich befristete Vorab-Freigabe für den Integrator
+    (siehe REQUIREMENTS §4.3). Innerhalb des Zeitfensters kann der Integrator
+    eine Verbindung ohne weitere Rückfrage aufbauen.
+  fields:
+    expires_in_hours:
+      name: Gültig für (Stunden)
+      description: Zeitraum, in dem die Vorab-Freigabe aktiv bleibt.
+      required: true
+      example: 8
+      selector:
+        number:
+          min: 1
+          max: 168
+          step: 1
+          unit_of_measurement: h
+    max_duration_hours:
+      name: Maximale Sessiondauer (Stunden)
+      description: Maximale Dauer einer einzelnen Fernzugriffs-Session.
+      required: false
+      example: 4
+      selector:
+        number:
+          min: 1
+          max: 12
+          step: 1
+          unit_of_measurement: h
+
+revoke_pre_authorization:
+  name: Vorab-Freigabe widerrufen
+  description: Widerruft eine zuvor erteilte Vorab-Freigabe.
+
+close_tunnel:
+  name: Tunnel trennen
+  description: >-
+    Trennt einen aktuell offenen Fernzugriffs-Tunnel sofort und beendet
+    gleichzeitig die laufende Wartungs-Session (siehe REQUIREMENTS §4.4).
+    Ein erneuter Zugriff erfordert eine neue Verbindungsanfrage.
+
+confirm_request:
+  name: Verbindungsanfrage bestätigen
+  description: >-
+    Bestätigt oder lehnt eine wartende Verbindungsanfrage des Integrators ab.
+    Die request_id stammt aus der Persistent Notification.
+  fields:
+    request_id:
+      name: Anfrage-ID
+      description: ID der Verbindungsanfrage.
+      required: true
+      example: req_abc123
+      selector:
+        text:
+    accepted:
+      name: Annehmen
+      description: True = annehmen, False = ablehnen.
+      required: true
+      example: true
+      selector:
+        boolean:
+    duration_hours:
+      name: Tatsächliche Dauer (Stunden)
+      description: Optional — kann die vom Integrator vorgeschlagene Dauer kürzen.
+      required: false
+      example: 4
+      selector:
+        number:
+          min: 1
+          max: 12
+          step: 1
+          unit_of_measurement: h

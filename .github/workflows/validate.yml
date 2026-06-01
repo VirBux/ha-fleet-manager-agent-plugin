@@ -1,0 +1,33 @@
+name: Validate
+
+# Läuft im gespiegelten Repo (VirBux/ha-fleet-manager-agent-plugin).
+# Im Monorepo liegt diese Datei unter ha-plugin/.github/ und wird dort NICHT
+# als Workflow erkannt — sie wird nur Teil des Subtree-Mirrors und läuft erst
+# im öffentlichen Plugin-Repo (dort als /.github/workflows/validate.yml).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Täglich, fängt neue HACS-/hassfest-Anforderungen auf.
+    - cron: "0 4 * * *"
+
+jobs:
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    name: Hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Hassfest validation
+        uses: home-assistant/actions/hassfest@master
