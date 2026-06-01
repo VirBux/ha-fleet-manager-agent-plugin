@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -44,11 +44,17 @@ _HA_AUTH_PROVIDER_TYPE = "homeassistant"
 
 @dataclass
 class IntegratorCredentials:
-    """Wartungs-User Zugangsdaten + Lebenszyklus-Info."""
+    """Wartungs-User Zugangsdaten + Lebenszyklus-Info.
+
+    Das Klartext-Passwort wird per ``field(repr=False)`` aus der automatischen
+    ``__repr__`` ausgeklammert — Defense-in-Depth gegen versehentliches Loggen
+    des ganzen Objekts (z.B. via Exception-Trace oder ``_LOGGER.x("%s", creds)``).
+    Funktional unveraendert: ``credentials.password`` liefert weiterhin den Wert.
+    """
 
     user_id: str
     username: str
-    password: str
+    password: str = field(repr=False)
     active: bool = True
     error: str | None = None
 
