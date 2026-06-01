@@ -66,7 +66,7 @@ class FleetConnectionSensor(SensorEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_name = "Verbindungsstatus"
+    _attr_translation_key = "connection_state"
     _attr_icon = "mdi:cloud-check"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
@@ -123,7 +123,7 @@ class _RemoteAccessSensorBase(SensorEntity):
 class RemoteAccessStatusSensor(_RemoteAccessSensorBase):
     """Aggregierter Status: idle | pre_authorized | session_active."""
 
-    _attr_name = "Fernzugriffs-Status"
+    _attr_translation_key = "remote_access_status"
     _attr_icon = "mdi:access-point-network"
     _attr_options = ["idle", "pre_authorized", "session_active"]
     _attr_device_class = SensorDeviceClass.ENUM
@@ -140,7 +140,7 @@ class RemoteAccessStatusSensor(_RemoteAccessSensorBase):
 class PreAuthExpiresSensor(_RemoteAccessSensorBase):
     """Ablaufzeitpunkt der aktiven Vorab-Freigabe."""
 
-    _attr_name = "Vorab-Freigabe läuft ab"
+    _attr_translation_key = "preauth_expires_at"
     _attr_icon = "mdi:calendar-clock"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
@@ -157,7 +157,7 @@ class PreAuthExpiresSensor(_RemoteAccessSensorBase):
 class SessionEndsSensor(_RemoteAccessSensorBase):
     """Endzeitpunkt der laufenden Fernzugriffs-Session."""
 
-    _attr_name = "Aktive Sitzung endet"
+    _attr_translation_key = "session_ends_at"
     _attr_icon = "mdi:timer-sand"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 

@@ -1,4 +1,4 @@
-"""HA Fleet Agent Integration für Home Assistant.
+"""HA Fleet Manager Agent Integration für Home Assistant.
 
 Phase 4 Architektur (TODO #50):
 - Zentrale aiohttp.ClientSession pro Entry (geteilt zwischen StateReporter,
@@ -293,7 +293,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async_at_started(hass, _ensure_dashboard_after_start)
 
     _LOGGER.info(
-        "HA Fleet Agent eingerichtet — Backend: %s, Relay: %s",
+        "HA Fleet Manager Agent eingerichtet — Backend: %s, Relay: %s",
         backend_url,
         relay_url,
     )
@@ -407,7 +407,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if http_session is not None and not http_session.closed:
         await http_session.close()
 
-    _LOGGER.info("HA Fleet Agent entladen (entry_id=%s)", entry.entry_id)
+    _LOGGER.info("HA Fleet Manager Agent entladen (entry_id=%s)", entry.entry_id)
     return True
 
 

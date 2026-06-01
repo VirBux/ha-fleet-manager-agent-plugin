@@ -150,7 +150,11 @@ class FleetWebSocketClient:
         Gibt False zurück wenn keine Verbindung aktiv ist (kein Puffern).
         """
         if self._ws is None or self._ws.closed:
-            _LOGGER.warning(
+            # DEBUG statt WARNING: Beim Tunnel-Abbau gibt es ein unvermeidbares
+            # Race — ein HA-Frame trifft ein, waehrend die Tunnel-WS schon zu
+            # ist. Der Rueckgabewert False signalisiert das dem Aufrufer; ein
+            # WARNING pro verworfenem Frame waere reines Log-Rauschen.
+            _LOGGER.debug(
                 "send_json aufgerufen ohne aktive WS-Verbindung — verworfen"
             )
             return False

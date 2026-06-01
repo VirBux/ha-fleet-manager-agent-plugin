@@ -2,15 +2,17 @@
   "config": {
     "step": {
       "user": {
-        "title": "HA Fleet Agent einrichten",
-        "description": "Gib den API-Key und die Basis-Domain ein. Den API-Key erhältst du im Fleet Manager Dashboard unter Einstellungen → Agenten.",
+        "title": "HA Fleet Manager Agent einrichten",
+        "description": "Gib API-Key, Basis-Domain und die Sprache für das Auto-Dashboard ein. Den API-Key erhältst du im Fleet Manager Dashboard unter Einstellungen → Agenten.",
         "data": {
           "api_key": "API-Key",
-          "base_domain": "Basis-Domain"
+          "base_domain": "Basis-Domain",
+          "language": "Sprache"
         },
         "data_description": {
           "api_key": "Mindestens 16 Zeichen langer Schlüssel aus dem Fleet Manager Dashboard.",
-          "base_domain": "Deine HA-Fleet-Manager-Domain, z.B. 'ha-fleet-manager.com'. Backend- und Relay-URL werden automatisch abgeleitet."
+          "base_domain": "Deine HA-Fleet-Manager-Domain, z.B. 'ha-fleet-manager.com'. Backend- und Relay-URL werden automatisch abgeleitet.",
+          "language": "Sprache für das automatisch erzeugte „Fernwartung\"-Dashboard. Voreingestellt ist deine Home-Assistant-Sprache. Ein Storage-Mode-Dashboard kann nachträglich nicht umübersetzt werden — zum Wechseln Plugin deinstallieren und neu installieren."
         }
       }
     },
@@ -19,7 +21,7 @@
       "invalid_base_domain": "Die Domain muss mindestens einen Punkt enthalten und darf keine Leerzeichen haben (z.B. ha-fleet-manager.com)."
     },
     "abort": {
-      "already_configured": "HA Fleet Agent ist bereits eingerichtet."
+      "already_configured": "HA Fleet Manager Agent ist bereits eingerichtet."
     }
   },
   "issues": {
@@ -45,6 +47,87 @@
         },
         "abort": {
           "already_resolved": "Diese Anfrage wurde bereits beantwortet."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "connection_state": {
+        "name": "Verbindungsstatus"
+      },
+      "remote_access_status": {
+        "name": "Fernzugriffs-Status"
+      },
+      "preauth_expires_at": {
+        "name": "Vorab-Freigabe läuft ab"
+      },
+      "session_ends_at": {
+        "name": "Aktive Sitzung endet"
+      }
+    },
+    "binary_sensor": {
+      "tunnel_active": {
+        "name": "Tunnel aktiv"
+      }
+    },
+    "switch": {
+      "pre_authorization": {
+        "name": "Vorab-Freigabe"
+      }
+    },
+    "number": {
+      "preauth_validity": {
+        "name": "Gültigkeitsdauer"
+      },
+      "preauth_max_duration": {
+        "name": "Max. Sitzungsdauer"
+      }
+    },
+    "button": {
+      "close_tunnel": {
+        "name": "Tunnel trennen"
+      }
+    }
+  },
+  "services": {
+    "grant_pre_authorization": {
+      "name": "Vorab-Freigabe erteilen",
+      "description": "Erteilt eine zeitlich befristete Vorab-Freigabe für den Integrator (siehe REQUIREMENTS §4.3). Innerhalb des Zeitfensters kann der Integrator eine Verbindung ohne weitere Rückfrage aufbauen.",
+      "fields": {
+        "expires_in_hours": {
+          "name": "Gültig für (Stunden)",
+          "description": "Zeitraum, in dem die Vorab-Freigabe aktiv bleibt."
+        },
+        "max_duration_hours": {
+          "name": "Maximale Sessiondauer (Stunden)",
+          "description": "Maximale Dauer einer einzelnen Fernzugriffs-Session."
+        }
+      }
+    },
+    "revoke_pre_authorization": {
+      "name": "Vorab-Freigabe widerrufen",
+      "description": "Widerruft eine zuvor erteilte Vorab-Freigabe."
+    },
+    "close_tunnel": {
+      "name": "Tunnel trennen",
+      "description": "Trennt einen aktuell offenen Fernzugriffs-Tunnel sofort und beendet gleichzeitig die laufende Wartungs-Session (siehe REQUIREMENTS §4.4). Ein erneuter Zugriff erfordert eine neue Verbindungsanfrage."
+    },
+    "confirm_request": {
+      "name": "Verbindungsanfrage bestätigen",
+      "description": "Bestätigt oder lehnt eine wartende Verbindungsanfrage des Integrators ab. Die request_id stammt aus der Persistent Notification.",
+      "fields": {
+        "request_id": {
+          "name": "Anfrage-ID",
+          "description": "ID der Verbindungsanfrage."
+        },
+        "accepted": {
+          "name": "Annehmen",
+          "description": "True = annehmen, False = ablehnen."
+        },
+        "duration_hours": {
+          "name": "Tatsächliche Dauer (Stunden)",
+          "description": "Optional — kann die vom Integrator vorgeschlagene Dauer kürzen."
         }
       }
     }

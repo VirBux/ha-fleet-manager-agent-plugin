@@ -46,7 +46,7 @@ class CloseTunnelButton(ButtonEntity):
     """Trennt den aktiven Tunnel und beendet die Wartungs-Session."""
 
     _attr_has_entity_name = True
-    _attr_name = "Tunnel trennen"
+    _attr_translation_key = "close_tunnel"
     _attr_icon = "mdi:lan-disconnect"
 
     def __init__(self, entry_id: str, ws_client, tunnel_forwarder, device_info) -> None:

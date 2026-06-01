@@ -71,7 +71,7 @@ class _BaseNumber(NumberEntity):
 class PreAuthValidityNumber(_BaseNumber):
     """Wie lange die Vorab-Freigabe gilt (Default 8 h, max. 168 h)."""
 
-    _attr_name = "Vorab-Freigabe Gültigkeitsdauer"
+    _attr_translation_key = "preauth_validity"
     _attr_icon = "mdi:timer-sand"
     _attr_native_min_value = 1
     _attr_native_max_value = MAX_PREAUTH_VALIDITY_HOURS
@@ -91,7 +91,7 @@ class PreAuthValidityNumber(_BaseNumber):
 class PreAuthMaxDurationNumber(_BaseNumber):
     """Maximale Sitzungsdauer einer einzelnen Verbindung (1–12 h)."""
 
-    _attr_name = "Vorab-Freigabe maximale Sitzungsdauer"
+    _attr_translation_key = "preauth_max_duration"
     _attr_icon = "mdi:timer-outline"
     _attr_native_min_value = 1
     _attr_native_max_value = MAX_SESSION_HOURS

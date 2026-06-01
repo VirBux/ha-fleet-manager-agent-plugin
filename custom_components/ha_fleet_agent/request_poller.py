@@ -11,6 +11,8 @@ Bekannte Actions:
   "connection_accepted" → TunnelManager._on_connection_accepted(data)
 
 Timeout: 10 s. Alle Fehler werden nur geloggt, Poller läuft weiter.
+Transiente Gateway-Fehler (502/503/504) gehen auf DEBUG (selbstheilend),
+alle anderen unerwarteten Stati auf WARNING.
 """
 
 from __future__ import annotations
@@ -107,6 +109,17 @@ class RequestPoller:
                 if resp.status in (401, 403):
                     _LOGGER.warning(
                         "Poll abgelehnt (HTTP %d) — API-Key prüfen", resp.status
+                    )
+                    return
+
+                if resp.status in (502, 503, 504):
+                    # Transiente Gateway-/Proxy-Fehler: Backend kurz nicht
+                    # erreichbar (Deploy, Neustart, Idle-Hickup). Selbstheilend —
+                    # der nächste Poll-Tick versucht es erneut. DEBUG statt
+                    # WARNING, sonst Log-Rauschen bei jedem Backend-Deploy.
+                    _LOGGER.debug(
+                        "Poll erhielt transienten Gateway-Status HTTP %d — ignoriert",
+                        resp.status,
                     )
                     return
 

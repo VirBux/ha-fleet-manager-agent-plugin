@@ -37,7 +37,7 @@ class PreAuthorizationSwitch(SwitchEntity):
     """Hauptschalter für die Vorab-Freigabe an den Integrator."""
 
     _attr_has_entity_name = True
-    _attr_name = "Vorab-Freigabe"
+    _attr_translation_key = "pre_authorization"
     _attr_icon = "mdi:shield-key-outline"
 
     def __init__(self, entry_id: str, remote_access, device_info) -> None:

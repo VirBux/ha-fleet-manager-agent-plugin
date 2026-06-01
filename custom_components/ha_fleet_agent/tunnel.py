@@ -162,32 +162,61 @@ class TunnelForwarder:
         pass
 
     async def async_shutdown(self) -> None:
-        """Bricht laufende Forwards ab und schliesst alle offenen WS-Verbindungen."""
-        # HTTP-Forwards abbrechen
-        for task in list(self._pending):
-            task.cancel()
-        if self._pending:
-            await asyncio.gather(*self._pending, return_exceptions=True)
-        self._pending.clear()
+        """Bricht laufende Forwards/Pumps ab und schliesst alle offenen WS-Verbindungen."""
+        await self._cleanup_tunnel_resources()
 
-        # WS-Pumps stoppen
-        for task in list(self._ws_pump_tasks.values()):
-            task.cancel()
-        if self._ws_pump_tasks:
-            await asyncio.gather(
-                *self._ws_pump_tasks.values(), return_exceptions=True
-            )
-        self._ws_pump_tasks.clear()
+    async def _cleanup_tunnel_resources(self) -> None:
+        """Gibt alle tunnel-gebundenen Hintergrund-Ressourcen frei.
 
-        # Alle aktiven HA-WS schliessen
-        for ha_ws in list(self._ha_ws.values()):
+        Bricht laufende HTTP-Forwards und WS-Pumps ab und schliesst die offenen
+        HA-WS-Verbindungen. Wird beim Plugin-Unload (async_shutdown) UND bei
+        jedem Tunnel-Close (_on_tunnel_closed) aufgerufen.
+
+        Ohne diesen Aufruf beim Tunnel-Close ueberleben die per ws_open
+        geoeffneten HA-WS-Verbindungen samt Pump-Tasks den Tunnel: HA pusht
+        weiter Frames (Event-Subscriptions), der Pump versucht sie ueber die
+        bereits tote Tunnel-WS zu senden -> 'send_json ohne aktive
+        WS-Verbindung'-Spam + Ressourcen-Leak (eine HA-WS + ein Task je
+        Browser-WebSocket, der ueber den Tunnel lief).
+
+        Arbeitet auf Snapshots und schliesst die HA-WS aus dem Snapshot: die
+        Pump-finallys leeren self._ha_ws/_ws_pump_tasks je nach Lauf-Zustand
+        selbst, schliessen die HA-WS-Verbindung aber NICHT. Anschliessend werden
+        gezielt nur die hier behandelten Eintraege entfernt (kein clear(), damit
+        ein zwischenzeitlich neu aufgebauter Tunnel nicht mitgeloescht wird).
+        """
+        forward_tasks = list(self._pending)
+        pump_items = list(self._ws_pump_tasks.items())
+        ha_ws_items = list(self._ha_ws.items())
+
+        # HTTP-Forwards + WS-Pumps abbrechen ...
+        for task in forward_tasks:
+            task.cancel()
+        for _ws_id, task in pump_items:
+            task.cancel()
+
+        # ... und auf ihr Ende warten (finally darf noch ws_close senden).
+        awaitable_tasks = forward_tasks + [task for _ws_id, task in pump_items]
+        if awaitable_tasks:
+            await asyncio.gather(*awaitable_tasks, return_exceptions=True)
+
+        # HA-WS aus dem Snapshot schliessen — zuverlaessig, auch wenn die
+        # Pump-finallys den Eintrag bereits aus self._ha_ws gepoppt haben.
+        for _ws_id, ha_ws in ha_ws_items:
             if not ha_ws.closed:
                 try:
                     await ha_ws.close()
                 except Exception:  # noqa: BLE001
                     _LOGGER.debug("HA-WS-Close fehlgeschlagen", exc_info=True)
-        self._ha_ws.clear()
-        self._ws_incoming_buffers.clear()
+
+        # Gezielt die behandelten Eintraege entfernen (kein clear()).
+        for task in forward_tasks:
+            self._pending.discard(task)
+        for ws_id, _task in pump_items:
+            self._ws_pump_tasks.pop(ws_id, None)
+        for ws_id, _ha_ws in ha_ws_items:
+            self._ha_ws.pop(ws_id, None)
+            self._ws_incoming_buffers.pop(ws_id, None)
 
     # ---------------------------------------------------------- Handler
 
@@ -229,12 +258,18 @@ class TunnelForwarder:
         await self._post_credentials(slug, credentials.username, credentials.password)
 
     def _on_tunnel_closed(self) -> None:
-        """WS-Verbindung wurde getrennt (vom Connector oder lokal) — DELETE Credentials + Session beenden."""
+        """WS-Verbindung wurde getrennt (vom Connector oder lokal) — Ressourcen
+        freigeben, DELETE Credentials, Session beenden."""
         slug = self._active_tunnel_slug
         if slug:
             self._hass.async_create_task(self._delete_credentials(slug))
         self._active_tunnel_slug = None
         self._active_tunnel_token = None
+        # Verwaiste WS-Pumps + HA-WS-Verbindungen dieses Tunnels freigeben. Ohne
+        # das senden die Pumps nach dem Tunnel-Abbau weiter ueber die tote
+        # Tunnel-WS ('send_json ohne aktive WS-Verbindung') und leaken HA-WS +
+        # Tasks (ein Eintrag pro Browser-WebSocket, der ueber den Tunnel lief).
+        self._hass.async_create_task(self._cleanup_tunnel_resources())
         self._publish_tunnel_state(False)
         if self._on_close is not None:
             self._hass.async_create_task(self._safe_on_close())

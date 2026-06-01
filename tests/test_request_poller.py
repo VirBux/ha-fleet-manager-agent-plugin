@@ -146,6 +146,39 @@ async def test_401_kein_crash():
 
 
 @pytest.mark.asyncio
+async def test_502_transienter_gateway_debug_statt_warning(caplog):
+    """502/503/504 (transiente Gateway-Fehler) → DEBUG, kein WARNING, kein Dispatch.
+
+    Backend kurz nicht erreichbar (Deploy/Neustart) ist selbstheilend; ein
+    WARNING pro Poll-Tick waere nur Log-Rauschen.
+    """
+    import logging
+
+    session = FakeSession(_FakeResponse(502))
+    hass = FakeHass()
+    poller = RequestPoller(hass, session, "https://api.ha-fleet-manager.com", "key")
+
+    dispatched: list[dict] = []
+
+    async def idle_handler(data: dict) -> None:
+        dispatched.append(data)
+
+    poller.register_handler("idle", idle_handler)
+
+    with caplog.at_level(logging.DEBUG):
+        await poller._poll_once()
+
+    # 502 ist kein 200/204 → kein Handler-Dispatch
+    assert dispatched == []
+    # Auf DEBUG geloggt (mit Status), NICHT auf WARNING
+    assert any(
+        r.levelno == logging.DEBUG and "502" in r.getMessage()
+        for r in caplog.records
+    )
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_timeout_kein_crash():
     """Timeout soll abgefangen werden."""
 

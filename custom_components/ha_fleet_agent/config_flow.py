@@ -1,6 +1,7 @@
-"""Config-Flow für die HA Fleet Agent Integration.
+"""Config-Flow für die HA Fleet Manager Agent Integration.
 
-Eingabe: API-Key + Basis-Domain (z.B. "ha-fleet-manager.com").
+Eingabe: API-Key, Basis-Domain (z.B. "ha-fleet-manager.com") und Sprache fuer
+das Auto-Dashboard.
 Ableitung:
   - backend_url = "https://api.<base_domain>"
   - relay_url   = "wss://relay.<base_domain>"
@@ -12,6 +13,13 @@ Annahme: Für exotische Setups wie "localhost" ohne Subdomain (kein Punkt im
 Hostnamen) wird ebenfalls der direkte Modus aktiviert und relay_url gleich
 backend_url mit ws(s)://-Schema gesetzt — "relay.localhost" wäre meist kein
 gültiger DNS-Name. Diese Logik ist explizit als MVP-Heuristik dokumentiert.
+
+Sprache (TODO #100): Endkunde waehlt explizit zwischen Deutsch und Englisch.
+Default ist die HA-Systemsprache (``hass.config.language``), gemappt auf
+``"de"`` oder ``"en"``. Wir lesen NICHT mehr aus ``hass.config.language``
+zur Dashboard-Render-Zeit — das war zu fehleranfaellig (HA-Profile-Sprache
+pro User vs. System-Sprache; Default-Voreinstellung in HAOS-Setup-Wizards
+oft falsch). Die explizite Wahl beim Setup ist die kanonische Quelle.
 """
 
 from __future__ import annotations
@@ -29,20 +37,18 @@ from .const import (
     CONF_API_KEY,
     CONF_BASE_DOMAIN,
     CONF_BACKEND_URL,
+    CONF_LANGUAGE,
     CONF_RELAY_URL,
+    DEFAULT_LANGUAGE,
     DOMAIN,
+    LANGUAGE_LABELS,
+    NAME,
+    SUPPORTED_LANGUAGES,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 MIN_API_KEY_LENGTH = 16
-
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_API_KEY): str,
-        vol.Required(CONF_BASE_DOMAIN, default="ha-fleet-manager.com"): str,
-    }
-)
 
 
 def derive_urls(base_domain: str) -> tuple[str, str]:
@@ -110,20 +116,46 @@ def validate_base_domain(value: str) -> str | None:
     return None
 
 
-class HaFleetAgentConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Config-Flow für HA Fleet Agent."""
+def _default_language_from_hass(hass: HomeAssistant | None) -> str:
+    """Default-Sprache aus ``hass.config.language`` — Praefix-Match auf DE/EN.
 
-    VERSION = 2  # Version erhöht wegen neuem Daten-Schema (base_domain statt WS-URL)
+    Beispiel: ``"de_DE"`` -> ``"de"``, ``"en_US"`` -> ``"en"``, ``"fr"`` ->
+    ``DEFAULT_LANGUAGE``. Greift defensiv, wenn ``hass`` oder ``hass.config``
+    fehlt (Test-Setup).
+    """
+    raw = ""
+    if hass is not None:
+        try:
+            raw = getattr(hass.config, "language", "") or ""
+        except Exception:  # noqa: BLE001
+            raw = ""
+    short = raw[:2].lower() if isinstance(raw, str) else ""
+    return short if short in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+
+class HaFleetAgentConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Config-Flow für HA Fleet Manager Agent."""
+
+    # Version 2 → 3: neues Pflichtfeld ``language``. Bestandsinstallationen
+    # bleiben kompatibel — dashboard.py fragt entry.data.get(CONF_LANGUAGE) und
+    # faellt auf hass.config.language zurueck, wenn das Feld fehlt.
+    VERSION = 3
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Erster Schritt: API-Key und Basis-Domain eingeben."""
+        """Erster Schritt: API-Key, Basis-Domain und Sprache eingeben."""
         errors: dict[str, str] = {}
+        default_language = _default_language_from_hass(self.hass)
 
         if user_input is not None:
             api_key = user_input[CONF_API_KEY].strip()
             base_domain = user_input[CONF_BASE_DOMAIN].strip()
+            language = user_input.get(CONF_LANGUAGE, default_language)
+            if language not in SUPPORTED_LANGUAGES:
+                # Defensiv — vol.In sollte das schon abfangen, hier dennoch
+                # gegen Manipulation absichern.
+                language = DEFAULT_LANGUAGE
 
             if len(api_key) < MIN_API_KEY_LENGTH:
                 errors[CONF_API_KEY] = "invalid_api_key"
@@ -139,22 +171,36 @@ class HaFleetAgentConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._abort_if_unique_id_configured()
 
                 _LOGGER.info(
-                    "HA Fleet Agent wird eingerichtet (Backend: %s, Relay: %s)",
+                    "HA Fleet Manager Agent wird eingerichtet (Backend: %s, "
+                    "Relay: %s, Sprache: %s)",
                     backend_url,
                     relay_url,
+                    language,
                 )
                 return self.async_create_entry(
-                    title="HA Fleet Agent",
+                    title=NAME,
                     data={
                         CONF_API_KEY: api_key,
                         CONF_BASE_DOMAIN: base_domain,
                         CONF_BACKEND_URL: backend_url,
                         CONF_RELAY_URL: relay_url,
+                        CONF_LANGUAGE: language,
                     },
                 )
 
+        # Schema dynamisch bauen — Default-Sprache haengt an hass.config.language.
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_API_KEY): str,
+                vol.Required(CONF_BASE_DOMAIN, default="ha-fleet-manager.com"): str,
+                vol.Required(CONF_LANGUAGE, default=default_language): vol.In(
+                    LANGUAGE_LABELS
+                ),
+            }
+        )
+
         return self.async_show_form(
             step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
+            data_schema=schema,
             errors=errors,
         )

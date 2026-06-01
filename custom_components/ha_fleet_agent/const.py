@@ -1,8 +1,8 @@
 """Konstanten für die HA Fleet Agent Integration."""
 
 DOMAIN = "ha_fleet_agent"
-NAME = "HA Fleet Agent"
-VERSION = "0.6.5"
+NAME = "HA Fleet Manager Agent"
+VERSION = "0.7.2"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -13,6 +13,19 @@ CONF_BACKEND_URL = "backend_url"
 # CONF_RELAY_URL — vollständig abgeleitete WebSocket-URL zum Connector/Relay
 # (z.B. "wss://relay.ha-fleet-manager.com"). Nur beim Tunnel-Aufbau genutzt.
 CONF_RELAY_URL = "relay_url"
+# CONF_LANGUAGE — vom Endkunden im Config-Flow gewaehlte Sprache fuer das
+# Auto-Dashboard. ``"de"`` oder ``"en"``. Bei Bestandsinstallationen aus 0.7.0
+# (Feld fehlt im ConfigEntry) faellt der Code defensiv auf hass.config.language
+# zurueck, damit das Update nicht crasht.
+CONF_LANGUAGE = "language"
+
+# Unterstuetzte Plugin-Sprachen + Default. Single Source of Truth — dashboard.py
+# und config_flow.py importieren von hier.
+SUPPORTED_LANGUAGES = ("de", "en")
+DEFAULT_LANGUAGE = "en"
+# Labels fuer den Sprach-Dropdown im Config-Flow. Bewusst nicht uebersetzt —
+# Sprachen werden in der jeweiligen Eigensprache bezeichnet (i18n-Best-Practice).
+LANGUAGE_LABELS = {"de": "Deutsch", "en": "English"}
 
 # Intervalle
 STATE_UPDATE_INTERVAL_SECONDS = 60

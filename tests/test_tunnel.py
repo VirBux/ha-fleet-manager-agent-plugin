@@ -1123,6 +1123,80 @@ async def test_tunnel_disconnect_schliesst_alle_offenen_ws_sessions(make_forward
 
 
 @pytest.mark.asyncio
+async def test_tunnel_closed_raeumt_verwaiste_ws_pumps_auf(make_forwarder):
+    """Regression: Beim Tunnel-Close muessen die per ws_open geoeffneten
+    HA-WS-Verbindungen + Pump-Tasks freigegeben werden.
+
+    Vorher raeumte nur async_shutdown (Plugin-Unload) auf, _on_tunnel_closed
+    nicht. Folge bei jedem 'Tunnel schliessen' (manuell ODER Abriss): HA pumpte
+    ueber die verwaiste HA-WS weiter Event-Frames, der Pump rief send_json ueber
+    die tote Tunnel-WS auf ('send_json ohne aktive WS-Verbindung'-Spam) +
+    HA-WS/Task-Leak pro Browser-WebSocket.
+    """
+    ha_ws_1 = FakeHaWs()
+    ha_ws_2 = FakeHaWs()
+    handlers_returned = [ha_ws_1, ha_ws_2]
+
+    async def ws_handler(call):
+        return handlers_returned.pop(0)
+
+    fwd, _, _, hass = make_forwarder(ws_handler=ws_handler)
+    fwd._active_tunnel_slug = "abc12345"
+
+    await fwd._open_ws_to_ha({
+        "tunnelId": "abc12345", "wsId": "w-1",
+        "path": "/api/websocket", "headers": {},
+    })
+    await fwd._open_ws_to_ha({
+        "tunnelId": "abc12345", "wsId": "w-2",
+        "path": "/api/websocket", "headers": {},
+    })
+    assert len(fwd._ha_ws) == 2
+
+    # Tunnel-Disconnect simulieren — entspricht dem Read-Loop-finally-Callback,
+    # der bei close_tunnel UND beim unerwarteten Abriss identisch feuert.
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    assert ha_ws_1.closed
+    assert ha_ws_2.closed
+    assert fwd._ha_ws == {}
+    assert fwd._ws_pump_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_tunnel_closed_schliesst_ha_ws_auch_bei_aktivem_pump(make_forwarder):
+    """Realer Fall: der Pump-Task laeuft bereits (haengt im async-for an der
+    HA-WS), wenn der Tunnel geschlossen wird.
+
+    Beim Cancel raeumt der Pump-finally self._ha_ws selbst leer, schliesst die
+    HA-WS aber NICHT. Der Cleanup muss sie trotzdem schliessen — das stellt die
+    Snapshot-Logik sicher (sonst bliebe die HA-WS offen und HA pumpte weiter).
+    """
+    ha_ws = FakeHaWs()
+
+    async def ws_handler(call):
+        return ha_ws
+
+    fwd, _, _, hass = make_forwarder(ws_handler=ws_handler)
+    fwd._active_tunnel_slug = "abc12345"
+
+    await fwd._open_ws_to_ha({
+        "tunnelId": "abc12345", "wsId": "w-1",
+        "path": "/api/websocket", "headers": {},
+    })
+    # Pump aktiv anlaufen lassen — er blockt jetzt im async-for an der HA-WS.
+    await asyncio.sleep(0)
+
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    assert ha_ws.closed, "HA-WS muss geschlossen sein, auch wenn der Pump lief"
+    assert fwd._ha_ws == {}
+    assert fwd._ws_pump_tasks == {}
+
+
+@pytest.mark.asyncio
 async def test_ha_ws_upgrade_failed_sendet_ws_close_an_connector(make_forwarder):
     """ws_connect wirft Exception (z.B. HA antwortet 400) → Plugin sendet
     ws_close an Connector mit Code 1011."""

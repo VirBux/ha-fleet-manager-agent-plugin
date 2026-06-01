@@ -1,4 +1,4 @@
-# HA Fleet Agent
+# HA Fleet Manager Agent
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 
@@ -22,9 +22,12 @@ port forwarding. Remote access is always **client-controlled**.
   Assistant UI through an encrypted tunnel over the relay — no inbound ports, no VPN.
 - **Connection requests in the HA UI**: incoming access requests appear as a Repair issue
   the customer can accept or reject, with an adjustable session duration.
-- **Auto-generated "Fernwartung" dashboard**: a dedicated Lovelace dashboard with status,
-  control and action cards is created automatically on first setup (existing dashboards are
-  never touched).
+- **Auto-generated remote-maintenance dashboard**: a dedicated Lovelace dashboard with
+  status, control and action cards is created automatically on first setup (existing
+  dashboards are never touched).
+- **Available in English and German**: you pick the language in the setup dialog (default
+  follows Home Assistant's configured language). The dashboard stays in the chosen language
+  even if Home Assistant later switches — remove and re-add the integration to change it.
 
 ## Requirements
 
@@ -39,7 +42,7 @@ port forwarding. Remote access is always **client-controlled**.
 2. Top-right menu (⋮) → **Custom repositories**.
 3. Add the repository URL `https://github.com/VirBux/ha-fleet-manager-agent-plugin` with category
    **Integration**, then click **Add**.
-4. Search for **HA Fleet Agent** in HACS and **Download** it.
+4. Search for **HA Fleet Manager Agent** in HACS and **Download** it.
 5. **Restart** Home Assistant.
 
 ### Manual
@@ -53,12 +56,14 @@ port forwarding. Remote access is always **client-controlled**.
 After installation, add the integration via the UI:
 
 1. **Settings → Devices & Services → Add Integration**.
-2. Search for **HA Fleet Agent**.
+2. Search for **HA Fleet Manager Agent**.
 3. Enter:
    - **API key** — at least 16 characters, found in the Fleet Manager dashboard under
      **Settings → Agents**.
    - **Base domain** — your HA Fleet Manager domain, e.g. `ha-fleet-manager.com`. The
      backend and relay URLs are derived automatically (`api.<domain>`, `relay.<domain>`).
+   - **Language** — Deutsch or English for the auto-generated dashboard. The dropdown
+     pre-selects whatever language Home Assistant itself is set to.
 
 That's it — the agent connects, starts reporting status, and creates the remote-maintenance
 dashboard.
@@ -79,5 +84,5 @@ Found a bug or have a question? Open an issue at
 
 Released under the [MIT License](LICENSE). © 2026 VirBux.
 
-The HA Fleet Agent is the open-source component of HA Fleet Manager; the platform's backend,
-dashboard and website are proprietary.
+The HA Fleet Manager Agent is the open-source component of HA Fleet Manager; the platform's
+backend, dashboard and website are proprietary.

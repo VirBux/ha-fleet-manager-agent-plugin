@@ -35,7 +35,7 @@ class TunnelActiveBinarySensor(BinarySensorEntity):
     """Zeigt, ob aktuell ein WS-Tunnel zum Connector offen ist."""
 
     _attr_has_entity_name = True
-    _attr_name = "Tunnel aktiv"
+    _attr_translation_key = "tunnel_active"
     _attr_icon = "mdi:tunnel"
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
 
