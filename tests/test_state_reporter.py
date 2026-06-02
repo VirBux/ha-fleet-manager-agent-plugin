@@ -131,6 +131,33 @@ async def test_payload_enthaelt_kein_api_key_und_kein_type_feld():
 
 
 @pytest.mark.asyncio
+async def test_payload_enthaelt_agent_version():
+    """Der Payload muss die eigene Plugin-Version als agent_version mitsenden (#100).
+
+    Das Backend speichert den Wert pro Installation; das Dashboard zeigt ihn in der
+    System-Karte neben der HA-Version an.
+    """
+    from ha_fleet_agent.const import VERSION
+
+    session = FakeSession(response_status=200)
+    hass = FakeHass()
+
+    reporter = StateReporter(
+        hass,
+        entry_id="test-entry",
+        session=session,
+        backend_url="https://api.ha-fleet-manager.com",
+        api_key="my-secret-api-key",
+    )
+
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    payload = session.calls[0]["json"]
+    assert payload["agent_version"] == VERSION
+
+
+@pytest.mark.asyncio
 async def test_5xx_fehler_kein_crash():
     """5xx-Antwort darf keinen Exception werfen — Ticker laeuft weiter."""
     session = FakeSession(response_status=503)
@@ -245,10 +272,35 @@ async def test_telemetrie_felder_aus_haos_supervisor_korrekt_gemappt():
         "disk_total": 100_000,  # MB
         "disk_used": 25_000,
     }
+    # Add-on-Mock im realen Supervisor-Format (#102): slug/name/version/
+    # version_latest/update_available/state — inkl. eines GESTOPPTEN Add-ons,
+    # das frueher herausgefiltert wurde.
     fake_supervisor_info = {
         "addons": [
-            {"name": "Terminal & SSH", "state": "started"},
-            {"name": "Studio Code Server", "state": "started"},
+            {
+                "slug": "core_mosquitto",
+                "name": "Mosquitto broker",
+                "version": "6.5.0",
+                "version_latest": "6.5.0",
+                "update_available": False,
+                "state": "started",
+            },
+            {
+                "slug": "a0d7b954_zigbee2mqtt",
+                "name": "Zigbee2MQTT",
+                "version": "2.5.1",
+                "version_latest": "2.6.0",
+                "update_available": True,
+                "state": "started",
+            },
+            {
+                "slug": "core_configurator",
+                "name": "File editor",
+                "version": "5.9.0",
+                "version_latest": "5.9.0",
+                "update_available": False,
+                "state": "stopped",
+            },
         ],
     }
     fake_core_stats = {
@@ -270,7 +322,103 @@ async def test_telemetrie_felder_aus_haos_supervisor_korrekt_gemappt():
     assert payload["cpu_percent"] == 12.3, "cpu_percent kommt aus core_stats"
     assert payload["ram_percent"] == 47.8, "ram_percent = core_stats.memory_percent"
     assert payload["disk_percent"] == 25.0, "disk_percent = 25000/100000 * 100"
-    assert len(payload["addons"]) == 2
+    # Add-ons als strukturierte Objekte (#102) — gestoppte erscheinen jetzt mit.
+    addons = payload["addons"]
+    assert len(addons) == 3, "alle installierten Add-ons (auch gestoppte) erscheinen"
+    assert addons[0] == {
+        "slug": "core_mosquitto",
+        "name": "Mosquitto broker",
+        "status": "running",
+        "version": "6.5.0",
+        "version_latest": "6.5.0",
+        "update_available": False,
+    }
+    assert addons[1]["update_available"] is True, "Update-Flag wird durchgereicht"
+    assert addons[2]["status"] == "stopped", "gestopptes Add-on nicht mehr gefiltert"
+
+
+def test_list_addons_mappt_status_und_felder():
+    """_list_addons normalisiert state→status und reicht alle Felder durch (#102)."""
+    supervisor_info = {
+        "addons": [
+            {
+                "slug": "core_ssh",
+                "name": "Terminal & SSH",
+                "version": "10.2.0",
+                "version_latest": "10.3.0",
+                "update_available": True,
+                "state": "started",
+            },
+        ]
+    }
+    assert StateReporter._list_addons(supervisor_info) == [
+        {
+            "slug": "core_ssh",
+            "name": "Terminal & SSH",
+            "status": "running",
+            "version": "10.2.0",
+            "version_latest": "10.3.0",
+            "update_available": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("started", "running"),
+        ("stopped", "stopped"),
+        ("error", "error"),
+        ("unknown", "stopped"),
+        ("startup", "stopped"),
+        (None, "stopped"),
+    ],
+)
+def test_list_addons_status_mapping(state, expected):
+    """Supervisor-state wird auf running/stopped/error normalisiert."""
+    supervisor_info = {"addons": [{"slug": "x", "name": "X", "state": state}]}
+    assert StateReporter._list_addons(supervisor_info)[0]["status"] == expected
+
+
+def test_list_addons_slug_ungleich_name_bleibt_erhalten():
+    """slug (stabiler Key) und name (Anzeige) sind getrennte Felder (#102)."""
+    supervisor_info = {
+        "addons": [
+            {"slug": "a0d7b954_vscode", "name": "Studio Code Server", "state": "started"}
+        ]
+    }
+    entry = StateReporter._list_addons(supervisor_info)[0]
+    assert entry["slug"] == "a0d7b954_vscode"
+    assert entry["name"] == "Studio Code Server"
+
+
+def test_list_addons_fehlende_felder_defensiv():
+    """Fehlende version/version_latest → None, fehlendes update_available → False."""
+    supervisor_info = {"addons": [{"slug": "core_x", "name": "X", "state": "started"}]}
+    entry = StateReporter._list_addons(supervisor_info)[0]
+    assert entry["version"] is None
+    assert entry["version_latest"] is None
+    assert entry["update_available"] is False
+
+
+def test_list_addons_ueberspringt_kaputte_eintraege():
+    """Kein-dict-Eintrag und Eintrag ganz ohne Identitaet werden uebersprungen."""
+    supervisor_info = {
+        "addons": [
+            "nicht-ein-dict",
+            {"state": "started"},  # weder slug noch name
+            {"slug": "core_ok", "name": "OK", "state": "started"},
+        ]
+    }
+    result = StateReporter._list_addons(supervisor_info)
+    assert len(result) == 1
+    assert result[0]["slug"] == "core_ok"
+
+
+def test_list_addons_leer_ohne_supervisor():
+    """Ohne Supervisor-Info (Nicht-HAOS) bleibt die Liste leer."""
+    assert StateReporter._list_addons(None) == []
+    assert StateReporter._list_addons({}) == []
 
 
 @pytest.mark.asyncio
@@ -360,13 +508,15 @@ async def test_psutil_host_stats_bevorzugt_vor_container_stats(monkeypatch):
     assert payload["ram_percent"] == 18.8, "psutil-RAM muss core_stats schlagen"
 
 
-def test_list_integrations_meldet_status_und_aggregiert_pro_domain():
-    """_list_integrations liefert {domain, status} statt nur Namen.
+@pytest.mark.asyncio
+async def test_list_integrations_meldet_status_und_aggregiert_pro_domain():
+    """_list_integrations liefert {domain, status, version} statt nur Namen.
 
     Prueft die Status-Normalisierung (active/stopped/error), dass die eigene
     Agent-Domain ausgeklammert wird, dass disabled_by Vorrang vor dem state hat
     und dass mehrere Entries derselben Domain mit dem schlechtesten Status
-    zusammengefasst werden (worst-case error > stopped > active).
+    zusammengefasst werden (worst-case error > stopped > active). Die Version
+    (eigener Test unten) ist hier ohne loader-Patch immer None.
     """
     from homeassistant.config_entries import ConfigEntryState
 
@@ -397,7 +547,7 @@ def test_list_integrations_meldet_status_und_aggregiert_pro_domain():
     reporter = StateReporter(
         hass, "e1", FakeSession(), "https://api.ha-fleet-manager.com", "key"
     )
-    result = reporter._list_integrations()
+    result = await reporter._list_integrations()
 
     by_domain = {e["domain"]: e["status"] for e in result}
     assert DOMAIN not in by_domain, "eigene Agent-Domain darf nicht gemeldet werden"
@@ -410,6 +560,60 @@ def test_list_integrations_meldet_status_und_aggregiert_pro_domain():
     }
     # pro Domain genau ein Eintrag, nach Domain sortiert
     assert [e["domain"] for e in result] == sorted(by_domain)
+    # version-Feld ist immer vorhanden (hier None — kein loader-Patch)
+    assert all("version" in e for e in result)
+    assert all(e["version"] is None for e in result)
+
+
+@pytest.mark.asyncio
+async def test_list_integrations_reichert_manifest_version_an():
+    """_list_integrations haengt pro Domain die Manifest-Version an.
+
+    Custom-/HACS-Integrationen fuehren eine Version im Manifest; HA-Core-
+    Integrationen meist nicht (-> None). `async_get_integrations` liefert je
+    Domain eine Integration (mit `.version`) oder eine Exception (-> None);
+    der Status bleibt von der Version unberuehrt.
+    """
+    from homeassistant.config_entries import ConfigEntryState
+
+    class _Entry:
+        def __init__(self, domain, state, disabled_by=None):
+            self.domain = domain
+            self.state = state
+            self.disabled_by = disabled_by
+
+    class _Integration:
+        def __init__(self, version):
+            self.version = version
+
+    hass = FakeHass()
+    hass.config_entries.async_entries = MagicMock(
+        return_value=[
+            _Entry("frigate", ConfigEntryState.LOADED),  # Custom -> Version
+            _Entry("hue", ConfigEntryState.LOADED),  # Core -> keine Version
+            _Entry("broken", ConfigEntryState.LOADED),  # Lookup wirft -> None
+        ]
+    )
+
+    async def _fake_get_integrations(_hass, _domains):
+        return {
+            "frigate": _Integration("5.6.0"),
+            "hue": _Integration(None),
+            "broken": RuntimeError("integration not found"),
+        }
+
+    reporter = StateReporter(
+        hass, "e1", FakeSession(), "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch(
+        "homeassistant.loader.async_get_integrations", _fake_get_integrations
+    ):
+        result = await reporter._list_integrations()
+
+    by_version = {e["domain"]: e["version"] for e in result}
+    assert by_version == {"frigate": "5.6.0", "hue": None, "broken": None}
+    # Status bleibt unabhaengig von der Version
+    assert all(e["status"] == "active" for e in result)
 
 
 @pytest.mark.asyncio

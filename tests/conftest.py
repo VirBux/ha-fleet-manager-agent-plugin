@@ -69,6 +69,7 @@ _ha_helpers_start = _ensure("homeassistant.helpers.start")
 _ha_util = _ensure("homeassistant.util")
 _ha_util_dt = _ensure("homeassistant.util.dt")
 _ha_config_entries = _ensure("homeassistant.config_entries")
+_ha_loader = _ensure("homeassistant.loader")
 _ha_const = _ensure("homeassistant.const")
 _ha_data_entry_flow = _ensure("homeassistant.data_entry_flow")
 _ha_components = _ensure("homeassistant.components")
@@ -312,6 +313,18 @@ class _ConfigEntryState(enum.Enum):
 
 
 _ha_config_entries.ConfigEntryState = _ConfigEntryState
+
+
+# --------------------------------------------------------- loader-Stub
+# state_reporter._integration_versions ruft
+# `homeassistant.loader.async_get_integrations(hass, domains)`. Default: keine
+# Version bekannt (leeres Mapping) — Tests, die Versionen pruefen, patchen die
+# Funktion gezielt mit Integration-Stubs, die ein `.version`-Attribut tragen.
+async def _async_get_integrations(_hass, _domains):  # noqa: ANN001, ANN202
+    return {}
+
+
+_ha_loader.async_get_integrations = _async_get_integrations
 
 
 class _ConfigFlowStub:

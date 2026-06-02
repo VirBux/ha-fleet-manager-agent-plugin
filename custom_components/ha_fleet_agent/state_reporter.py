@@ -39,6 +39,7 @@ from .const import (
     MAX_WARNING_LOGS,
     SIGNAL_CONNECTION_STATE,
     STATE_UPDATE_INTERVAL_SECONDS,
+    VERSION,
     WARNING_LOG_LEVELS,
 )
 
@@ -168,6 +169,9 @@ class StateReporter:
             lambda: self._stringify_version(HA_CORE_VERSION)
             or self._stringify_version(getattr(self._hass.config, "version", None))
         )
+        # agent_version: eigene Plugin-Version (#100) — statische Konstante, kein
+        # _safe noetig. Wird in der System-Karte des Kundendetails angezeigt.
+        payload["agent_version"] = VERSION
         payload["uptime_seconds"] = self._safe(
             lambda: int(time.monotonic() - self._started_at)
         )
@@ -181,7 +185,7 @@ class StateReporter:
             lambda: len(self._hass.states.async_all("automation"))
         )
         payload["dashboards_count"] = self._safe(self._count_dashboards)
-        payload["integrations"] = self._safe(self._list_integrations) or []
+        payload["integrations"] = await self._safe_async(self._list_integrations) or []
         payload["warnings"] = self._safe(self._count_persistent_notifications) or 0
         # Kritische Logs (ERROR/CRITICAL) aus HAs system_log als Snapshot (#65).
         # Loest den frueheren Post-MVP-Platzhalter (errors = 0) ab: errors ist jetzt
@@ -208,7 +212,7 @@ class StateReporter:
         )
         payload["ip"] = self._safe(lambda: self._resolve_ip(host_info))
         payload["addons"] = self._safe(
-            lambda: self._list_started_addons(supervisor_info)
+            lambda: self._list_addons(supervisor_info)
         ) or []
 
         # Diagnose-Log: ohne PII, Quelle pro Feld — hilft beim Bug-Triaging.
@@ -333,6 +337,15 @@ class StateReporter:
             return None
 
     @staticmethod
+    async def _safe_async(coro_fn: Any) -> Any:
+        """Async-Variante von :meth:`_safe` — erwartet eine Coroutine-Funktion."""
+        try:
+            return await coro_fn()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Sammlung einzelnes Feld fehlgeschlagen", exc_info=True)
+            return None
+
+    @staticmethod
     def _stringify_version(raw: Any) -> str | None:
         """Konvertiert HA-Version robust zu String — egal ob str oder AwesomeVersion."""
         if raw is None:
@@ -352,12 +365,13 @@ class StateReporter:
             return None
         return len(dashboards)
 
-    def _list_integrations(self) -> list[dict[str, str]]:
-        """Integrationen samt Status — pro Domain aggregiert, eigene Domain ausgeklammert.
+    async def _list_integrations(self) -> list[dict[str, str | None]]:
+        """Integrationen samt Status und Version — pro Domain aggregiert, eigene Domain ausgeklammert.
 
         Frueher wurde nur der Domain-Name geladener Integrationen gemeldet; gestoppte
         oder fehlerhafte Integrationen fielen still unter den Tisch. Jetzt wird pro
-        Integration ein {domain, status} gemeldet, normalisiert auf drei UI-Zustaende:
+        Integration ein {domain, status, version} gemeldet, normalisiert auf drei
+        UI-Zustaende:
 
         - ``"active"``  — laeuft (``ConfigEntryState.LOADED``).
         - ``"error"``   — Laden fehlgeschlagen (``SETUP_ERROR`` / ``SETUP_RETRY`` /
@@ -369,6 +383,11 @@ class StateReporter:
         EINEM Eintrag zusammengefasst; der schlechteste Status gewinnt
         (``error`` > ``stopped`` > ``active``), damit eine ausgefallene Instanz im
         Monitoring nicht von einer laufenden ueberdeckt wird.
+
+        ``version`` ist die Manifest-Version der Integration (``None``, wenn keine
+        vorhanden — Normalfall bei HA-Core-Integrationen, siehe
+        :meth:`_integration_versions`). Der Versions-Lookup ist bewusst defensiv
+        gekapselt: schlaegt er fehl, bleibt der Status erhalten (``version`` = None).
         """
         from homeassistant.config_entries import ConfigEntryState  # noqa: PLC0415
 
@@ -397,10 +416,44 @@ class StateReporter:
             if entry.domain not in worst or rank[status] > rank[worst[entry.domain]]:
                 worst[entry.domain] = status
 
+        # Version ist optional — der Status hat Vorrang. Faellt der (gebuendelte)
+        # Lookup komplett aus, bleibt die Liste samt Status erhalten (version=None).
+        try:
+            versions = await self._integration_versions(set(worst))
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Integrations-Versionen nicht ermittelbar", exc_info=True)
+            versions = {}
+
         return [
-            {"domain": domain, "status": status}
+            {"domain": domain, "status": status, "version": versions.get(domain)}
             for domain, status in sorted(worst.items())
         ]
+
+    async def _integration_versions(self, domains: set[str]) -> dict[str, str | None]:
+        """Manifest-Version je Domain (oder ``None``).
+
+        Die Version steht im ``manifest.json`` der Integration und ist bei
+        HA-Core-Integrationen meist NICHT gesetzt — nur Custom-/HACS-Integrationen
+        fuehren sie zuverlaessig (``integration.version`` ist dann ``None``).
+        ``async_get_integrations`` laedt alle Domains gebuendelt (ein Aufruf) und
+        liefert je Domain entweder eine ``Integration`` oder eine Exception; beides
+        wird defensiv auf ``None`` abgebildet.
+        """
+        if not domains:
+            return {}
+        from homeassistant.loader import async_get_integrations  # noqa: PLC0415
+
+        result: dict[str, str | None] = {}
+        for domain, integration in (
+            await async_get_integrations(self._hass, domains)
+        ).items():
+            if isinstance(integration, Exception):
+                result[domain] = None
+                continue
+            result[domain] = self._stringify_version(
+                getattr(integration, "version", None)
+            )
+        return result
 
     def _count_persistent_notifications(self) -> int:
         """MVP: Alle Persistent Notifications als Warnung zählen."""
@@ -657,14 +710,48 @@ class StateReporter:
         return None
 
     @staticmethod
-    def _list_started_addons(supervisor_info: dict | None) -> list[str]:
+    def _list_addons(supervisor_info: dict | None) -> list[dict[str, Any]]:
+        """Alle installierten Add-ons samt Status/Version/Update (#102).
+
+        Quelle: ``get_supervisor_info(hass)["addons"]`` — je Eintrag traegt
+        ``slug, name, version, version_latest, update_available, state`` (auf der
+        Test-VM verifiziert). Frueher meldete das Plugin nur die *Namen* der
+        **gestarteten** Add-ons; jetzt werden **alle** installierten gemeldet,
+        damit das Kundendetail laufende (gruen) von gestoppten (grau)
+        unterscheiden kann — der Filter ``state == "started"`` faellt also weg.
+
+        ``status`` ist auf drei UI-Zustaende normalisiert: ``running`` (Supervisor
+        ``started``), ``error`` (``error``) und ``stopped`` (alles uebrige —
+        ``stopped``/``unknown``/``startup``/...). ``slug`` ist der stabile
+        Schluessel, ``name`` der Anzeigename (beide unterscheiden sich, z.B.
+        ``core_ssh`` vs. „Terminal & SSH").
+
+        Pro Add-on defensiv: ein kaputter Eintrag (kein dict, gar keine
+        Identitaet) wird uebersprungen und reisst die Liste nicht mit.
+        """
         if not supervisor_info:
             return []
-        addons = supervisor_info.get("addons") or []
-        return [
-            a.get("name")
-            for a in addons
-            if isinstance(a, dict)
-            and a.get("state") == "started"
-            and a.get("name")
-        ]
+        # Supervisor-state → normalisierter UI-Status. Nur "started" und "error"
+        # werden direkt gemappt; jeder andere Wert gilt als gestoppt.
+        status_map = {"started": "running", "error": "error"}
+        result: list[dict[str, Any]] = []
+        for addon in supervisor_info.get("addons") or []:
+            if not isinstance(addon, dict):
+                continue
+            slug = addon.get("slug")
+            name = addon.get("name")
+            if not slug and not name:
+                continue
+            result.append(
+                {
+                    "slug": slug,
+                    "name": name,
+                    "status": status_map.get(addon.get("state"), "stopped"),
+                    "version": StateReporter._stringify_version(addon.get("version")),
+                    "version_latest": StateReporter._stringify_version(
+                        addon.get("version_latest")
+                    ),
+                    "update_available": bool(addon.get("update_available")),
+                }
+            )
+        return result
