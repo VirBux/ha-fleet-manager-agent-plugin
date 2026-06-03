@@ -56,6 +56,7 @@ from .remote_access import RemoteAccessManager
 from .request_poller import RequestPoller
 from .state_reporter import StateReporter
 from .tunnel import TunnelForwarder
+from .update_handler import UpdateCommandHandler
 from .websocket_client import FleetWebSocketClient
 
 # Storage-Keys für die neuen Module
@@ -63,6 +64,7 @@ DATA_INTEGRATOR_USER = "integrator_user"
 DATA_TUNNEL_FORWARDER = "tunnel_forwarder"
 DATA_STATE_REPORTER = "state_reporter"
 DATA_REQUEST_POLLER = "request_poller"
+DATA_UPDATE_HANDLER = "update_handler"
 DATA_HTTP_SESSION = "http_session"
 
 # Config-Option: User bei Plugin-Deinstallation behalten?
@@ -253,6 +255,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Self-Healing-Handler (#90): raeumt verwaiste Repair-Issues, sobald der Poll
     # "nichts offen" (HTTP 204 → synthetische "idle"-Aktion) meldet.
     request_poller.register_handler("idle", remote_access._on_poll_idle)
+    # Update-Befehle (#103): das Backend liefert in ruhigen Ticks (keine
+    # Connection-Action offen) die Action "update_batch" mit allen offenen
+    # Update-Commands; der Handler arbeitet sie sequenziell via update.install ab.
+    update_handler = UpdateCommandHandler(
+        hass,
+        session=http_session,
+        backend_url=backend_url,
+        api_key=api_key,
+    )
+    request_poller.register_handler("update_batch", update_handler.handle)
 
     hass.data[DOMAIN][entry.entry_id] = {
         CONF_API_KEY: api_key,
@@ -264,6 +276,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_TUNNEL_FORWARDER: tunnel_forwarder,
         DATA_STATE_REPORTER: state_reporter,
         DATA_REQUEST_POLLER: request_poller,
+        DATA_UPDATE_HANDLER: update_handler,
         DATA_DEVICE_INFO: build_device_info(entry.entry_id, backend_url),
     }
 

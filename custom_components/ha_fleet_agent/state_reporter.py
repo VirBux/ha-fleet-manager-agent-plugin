@@ -20,6 +20,7 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -44,6 +45,22 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# update.*-Entities mit fester Identitaet (#103). HA-Core/OS/Supervisor tragen
+# stabile Entity-IDs; daran haengt die kind-Ableitung (Add-ons/Integrationen
+# haben keine festen IDs und werden ueber das entity_picture bzw. als Rest
+# klassifiziert — siehe StateReporter._classify_update).
+_SYSTEM_UPDATE_KINDS = {
+    "update.home_assistant_core_update": "core",
+    "update.home_assistant_operating_system_update": "os",
+    "update.home_assistant_supervisor_update": "supervisor",
+}
+
+# Add-on-update-Entities tragen als entity_picture das Supervisor-Icon im Format
+# /api/hassio/addons/<slug>/icon (Research §5). Der slug ist der stabile Schluessel
+# fuers Matching mit addons[]. .search() statt .match(), weil das Backend evtl.
+# einen Host-Prefix/Query-Param anhaengt.
+_ADDON_PICTURE_RE = re.compile(r"/api/hassio/addons/(?P<slug>[^/]+)/icon")
 
 
 class StateReporter:
@@ -214,10 +231,13 @@ class StateReporter:
         payload["addons"] = self._safe(
             lambda: self._list_addons(supervisor_info)
         ) or []
+        # updates[] (#103): alle update.*-Entities — Quelle der Updates-Unterseite.
+        # Liest direkt hass.states, braucht also keine Supervisor-Info.
+        payload["updates"] = self._safe(self._list_updates) or []
 
         # Diagnose-Log: ohne PII, Quelle pro Feld — hilft beim Bug-Triaging.
         _LOGGER.debug(
-            "State-Payload aufgebaut — ha_version=%s cpu=%s(%s) ram=%s(%s) disk=%s ip=%s addons=%d",
+            "State-Payload aufgebaut — ha_version=%s cpu=%s(%s) ram=%s(%s) disk=%s ip=%s addons=%d updates=%d",
             payload.get("ha_version"),
             payload.get("cpu_percent"),
             cpu_source,
@@ -226,6 +246,7 @@ class StateReporter:
             payload.get("disk_percent"),
             payload.get("ip"),
             len(payload.get("addons", [])),
+            len(payload.get("updates", [])),
         )
 
         return payload
@@ -755,3 +776,77 @@ class StateReporter:
                 }
             )
         return result
+
+    def _list_updates(self) -> list[dict[str, Any]]:
+        """Alle ``update.*``-Entities als ``updates[]`` fuer die Updates-Unterseite (#103).
+
+        Home Assistant exponiert alles Updatebare — HA Core, OS, Supervisor, jedes
+        Add-on und jede HACS-/Custom-Integration — als ``update.*``-Entity (Research
+        §1). Getriggert wird spaeter ueber ``update.install`` (siehe update_handler.py);
+        diese Methode liefert nur den Anzeige-Snapshot.
+
+        Pro Entity wird gemeldet:
+        - ``kind`` ∈ {core, os, supervisor, addon, integration} — abgeleitet in
+          :meth:`_classify_update` (feste System-Entity-IDs; Add-on am entity_picture;
+          alles uebrige = Integration, faktisch HACS/Custom).
+        - ``slug`` — nur bei Add-ons (aus dem entity_picture), fuers Matching mit
+          ``addons[]``; sonst ``None``.
+        - ``update_available`` — HA-Konvention: State ``"on"`` = Update verfuegbar.
+        - ``supported_features`` — Bitmaske, an der das Frontend Versionswahl
+          (SPECIFIC_VERSION=2) und Backup-vor-Update (BACKUP=8) festmacht.
+
+        Defensiv pro Entity: ein kaputter State wird uebersprungen und reisst die
+        Liste nicht mit (zusaetzlich von ``_safe`` umschlossen).
+        """
+        result: list[dict[str, Any]] = []
+        for st in self._hass.states.async_all("update"):
+            try:
+                attrs = getattr(st, "attributes", None) or {}
+                entity_id = st.entity_id
+                kind, slug = self._classify_update(entity_id, attrs.get("entity_picture"))
+                result.append(
+                    {
+                        "entity_id": entity_id,
+                        "title": (
+                            attrs.get("title")
+                            or attrs.get("friendly_name")
+                            or entity_id
+                        ),
+                        "kind": kind,
+                        "installed_version": self._stringify_version(
+                            attrs.get("installed_version")
+                        ),
+                        "latest_version": self._stringify_version(
+                            attrs.get("latest_version")
+                        ),
+                        "update_available": st.state == "on",
+                        "in_progress": bool(attrs.get("in_progress")),
+                        "supported_features": int(attrs.get("supported_features") or 0),
+                        "release_url": attrs.get("release_url"),
+                        "slug": slug,
+                    }
+                )
+            except Exception:  # noqa: BLE001 — ein kaputter State darf die Liste nicht mitreissen
+                _LOGGER.debug("update-Entity uebersprungen", exc_info=True)
+        return result
+
+    @staticmethod
+    def _classify_update(
+        entity_id: str, entity_picture: Any
+    ) -> tuple[str, str | None]:
+        """Leitet ``(kind, slug)`` einer ``update.*``-Entity ab.
+
+        - HA Core/OS/Supervisor: feste Entity-IDs (:data:`_SYSTEM_UPDATE_KINDS`).
+        - Add-on: ``entity_picture`` == ``/api/hassio/addons/<slug>/icon`` →
+          ``("addon", slug)``.
+        - sonst: ``("integration", None)`` — faktisch HACS/Custom, da Core-
+          Integrationen keine eigene update-Entity fuehren (Research §4).
+        """
+        system_kind = _SYSTEM_UPDATE_KINDS.get(entity_id)
+        if system_kind is not None:
+            return system_kind, None
+        if isinstance(entity_picture, str):
+            match = _ADDON_PICTURE_RE.search(entity_picture)
+            if match:
+                return "addon", match.group("slug")
+        return "integration", None

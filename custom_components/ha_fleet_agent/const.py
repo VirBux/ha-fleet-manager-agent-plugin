@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"

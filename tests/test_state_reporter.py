@@ -421,6 +421,189 @@ def test_list_addons_leer_ohne_supervisor():
     assert StateReporter._list_addons({}) == []
 
 
+# --------------------------------------------------------- updates[] (#103)
+
+
+class _FakeState:
+    """Minimaler hass.states-State-Stub: entity_id + state + attributes."""
+
+    def __init__(self, entity_id: str, state: str, attributes: dict | None = None):
+        self.entity_id = entity_id
+        self.state = state
+        self.attributes = attributes or {}
+
+
+def _updates_reporter(update_states: list[_FakeState]) -> StateReporter:
+    """Reporter, dessen hass.states.async_all('update') die gegebenen States liefert."""
+    hass = FakeHass()
+    hass.states.async_all = MagicMock(return_value=update_states)
+    return StateReporter(
+        hass, "e1", FakeSession(), "https://api.ha-fleet-manager.com", "key"
+    )
+
+
+def test_list_updates_addon_extrahiert_slug_aus_entity_picture():
+    """Add-on-update: kind=addon, slug aus /api/hassio/addons/<slug>/icon (Research §5)."""
+    state = _FakeState(
+        "update.terminal_ssh_update",
+        "on",
+        {
+            "title": "Terminal & SSH",
+            "installed_version": "10.2.0",
+            "latest_version": "10.3.0",
+            "entity_picture": "/api/hassio/addons/core_ssh/icon",
+            "supported_features": 29,
+        },
+    )
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["kind"] == "addon"
+    assert entry["slug"] == "core_ssh"
+    assert entry["title"] == "Terminal & SSH"
+    assert entry["installed_version"] == "10.2.0"
+    assert entry["latest_version"] == "10.3.0"
+    assert entry["update_available"] is True
+    assert entry["supported_features"] == 29
+
+
+def test_list_updates_core_kind_und_keine_slug():
+    """HA-Core-update: kind=core ueber feste Entity-ID, slug=None, feat durchgereicht."""
+    state = _FakeState(
+        "update.home_assistant_core_update",
+        "on",
+        {
+            "title": "Home Assistant Core",
+            "installed_version": "2026.5.1",
+            "latest_version": "2026.5.4",
+            "supported_features": 15,
+            "release_url": "https://www.home-assistant.io/latest-release-notes/",
+        },
+    )
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["kind"] == "core"
+    assert entry["slug"] is None
+    assert entry["supported_features"] == 15
+    assert entry["release_url"].startswith("https://")
+
+
+@pytest.mark.parametrize(
+    ("entity_id", "expected_kind"),
+    [
+        ("update.home_assistant_core_update", "core"),
+        ("update.home_assistant_operating_system_update", "os"),
+        ("update.home_assistant_supervisor_update", "supervisor"),
+    ],
+)
+def test_list_updates_system_entities_kind(entity_id, expected_kind):
+    """Core/OS/Supervisor werden ueber ihre festen Entity-IDs klassifiziert."""
+    state = _FakeState(entity_id, "off", {"supported_features": 11})
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["kind"] == expected_kind
+    assert entry["update_available"] is False
+
+
+def test_list_updates_integration_ist_default():
+    """Eine update-Entity ohne System-ID und ohne Add-on-Bild gilt als Integration."""
+    state = _FakeState(
+        "update.frigate_update",
+        "on",
+        {"title": "Frigate", "installed_version": "0.13.0", "latest_version": "0.14.0"},
+    )
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["kind"] == "integration"
+    assert entry["slug"] is None
+
+
+def test_list_updates_fehlende_attribute_defensiv():
+    """Leere Attribute: title faellt auf entity_id, Versionen None, feat=0, in_progress False."""
+    state = _FakeState("update.something", "off", {})
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["title"] == "update.something"
+    assert entry["installed_version"] is None
+    assert entry["latest_version"] is None
+    assert entry["supported_features"] == 0
+    assert entry["in_progress"] is False
+    assert entry["update_available"] is False
+
+
+def test_list_updates_in_progress_durchgereicht():
+    """in_progress-Attribut wird als bool durchgereicht."""
+    state = _FakeState("update.x", "on", {"in_progress": True, "supported_features": 4})
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["in_progress"] is True
+
+
+def test_list_updates_ueberspringt_kaputte_states():
+    """Ein State, dessen Zugriff scheitert, reisst die Liste nicht mit."""
+
+    class _BrokenState:
+        entity_id = "update.broken"
+
+        @property
+        def state(self):  # noqa: ANN201
+            raise RuntimeError("kaputt")
+
+        attributes: dict = {}
+
+    good = _FakeState("update.ok", "on", {"supported_features": 1})
+    result = _updates_reporter([_BrokenState(), good])._list_updates()
+    assert len(result) == 1
+    assert result[0]["entity_id"] == "update.ok"
+
+
+@pytest.mark.parametrize(
+    ("entity_id", "picture", "expected"),
+    [
+        ("update.home_assistant_core_update", None, ("core", None)),
+        ("update.home_assistant_operating_system_update", None, ("os", None)),
+        ("update.home_assistant_supervisor_update", None, ("supervisor", None)),
+        ("update.terminal_ssh_update", "/api/hassio/addons/core_ssh/icon", ("addon", "core_ssh")),
+        ("update.vscode_update", "/api/hassio/addons/a0d7b954_vscode/icon?token=x", ("addon", "a0d7b954_vscode")),
+        ("update.frigate_update", "/api/frigate/notifications/thumb.jpg", ("integration", None)),
+        ("update.hacs_update", None, ("integration", None)),
+    ],
+)
+def test_classify_update(entity_id, picture, expected):
+    """(kind, slug)-Ableitung: feste IDs, Add-on-Bild, sonst Integration."""
+    assert StateReporter._classify_update(entity_id, picture) == expected
+
+
+@pytest.mark.asyncio
+async def test_payload_enthaelt_updates_liste():
+    """End-to-end: _push_once legt das updates[]-Feld in den Payload (#103)."""
+    def _async_all(domain=None):
+        if domain == "update":
+            return [
+                _FakeState(
+                    "update.terminal_ssh_update",
+                    "on",
+                    {
+                        "title": "Terminal & SSH",
+                        "entity_picture": "/api/hassio/addons/core_ssh/icon",
+                        "installed_version": "10.2.0",
+                        "latest_version": "10.3.0",
+                        "supported_features": 29,
+                    },
+                )
+            ]
+        return []
+
+    session = FakeSession(response_status=200)
+    hass = FakeHass()
+    hass.config.version = "2026.5.0"
+    hass.states.async_all = MagicMock(side_effect=_async_all)
+
+    reporter = StateReporter(
+        hass, "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    updates = session.calls[0]["json"]["updates"]
+    assert len(updates) == 1
+    assert updates[0]["kind"] == "addon"
+    assert updates[0]["slug"] == "core_ssh"
+
+
 @pytest.mark.asyncio
 async def test_ha_version_awesome_version_objekt_wird_zu_string():
     """Wenn hass.config.version ein Objekt ist (AwesomeVersion), muss
