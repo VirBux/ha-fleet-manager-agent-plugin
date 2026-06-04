@@ -47,8 +47,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # update.*-Entities mit fester Identitaet (#103). HA-Core/OS/Supervisor tragen
-# stabile Entity-IDs; daran haengt die kind-Ableitung (Add-ons/Integrationen
-# haben keine festen IDs und werden ueber das entity_picture bzw. als Rest
+# stabile Entity-IDs; daran haengt die kind-Ableitung (Add-ons/Integrationen/Geraete
+# haben keine festen IDs und werden ueber entity_picture, device_class bzw. als Rest
 # klassifiziert — siehe StateReporter._classify_update).
 _SYSTEM_UPDATE_KINDS = {
     "update.home_assistant_core_update": "core",
@@ -61,6 +61,15 @@ _SYSTEM_UPDATE_KINDS = {
 # fuers Matching mit addons[]. .search() statt .match(), weil das Backend evtl.
 # einen Host-Prefix/Query-Param anhaengt.
 _ADDON_PICTURE_RE = re.compile(r"/api/hassio/addons/(?P<slug>[^/]+)/icon")
+
+# Geraete-Firmware-update-Entities (Shelly, ZHA/Zigbee, ESPHome, Tuya, ...) tragen
+# device_class == "firmware" (homeassistant.components.update.UpdateDeviceClass.FIRMWARE).
+# Das ist der saubere Negativ-Marker gegen echte Software-Komponenten: Add-ons,
+# HACS-/Custom-Integrationen und die System-Entities fuehren KEIN device_class.
+# Daran haengt der kind="device"-Zweig — diese Entities sind *Geraete-Firmware*, keine
+# Integrationen, und werden in der Updates-Unterseite nur read-only angezeigt
+# (Firmware wird NICHT ferngeflasht; der Endkunde loest sie am Geraet selbst aus).
+_UPDATE_DEVICE_CLASS_FIRMWARE = "firmware"
 
 
 class StateReporter:
@@ -203,7 +212,6 @@ class StateReporter:
         )
         payload["dashboards_count"] = self._safe(self._count_dashboards)
         payload["integrations"] = await self._safe_async(self._list_integrations) or []
-        payload["warnings"] = self._safe(self._count_persistent_notifications) or 0
         # Kritische Logs (ERROR/CRITICAL) aus HAs system_log als Snapshot (#65).
         # Loest den frueheren Post-MVP-Platzhalter (errors = 0) ab: errors ist jetzt
         # die Anzahl distinkter Fehler-Eintraege, error_logs traegt die Details.
@@ -212,8 +220,15 @@ class StateReporter:
         payload["errors"] = len(error_logs)
         # Warnungen (WARNING) als eigene Liste — getrennt von error_logs, damit
         # haeufige Warnungen die Fehler nicht aus dem Limit verdraengen. Eigene
-        # warning_logs-Spalte im Backend.
-        payload["warning_logs"] = self._safe(self._collect_warning_logs) or []
+        # warning_logs-Spalte im Backend. warnings ist — exakt wie errors — die
+        # Anzahl dieser Log-Eintraege, damit das UI-Badge immer deckungsgleich mit
+        # der Warnungs-Liste ist. Frueher kam die Zahl aus den Persistent
+        # Notifications (z.B. "Update verfuegbar"); die erschienen als Warnung ohne
+        # passenden Listeneintrag und liessen nicht erkennen, was das Problem ist
+        # — daher abgeloest und #80 (Notifications durchreichen) verworfen.
+        warning_logs = self._safe(self._collect_warning_logs) or []
+        payload["warning_logs"] = warning_logs
+        payload["warnings"] = len(warning_logs)
 
         # ----- Supervisor-API (nur HAOS) -----
         host_info, supervisor_info, core_stats = await self._fetch_supervisor_info()
@@ -475,18 +490,6 @@ class StateReporter:
                 getattr(integration, "version", None)
             )
         return result
-
-    def _count_persistent_notifications(self) -> int:
-        """MVP: Alle Persistent Notifications als Warnung zählen."""
-        notifications = self._hass.data.get("persistent_notification")
-        if notifications is None:
-            return 0
-        if isinstance(notifications, dict):
-            return len(notifications)
-        items = getattr(notifications, "_persistent_notifications", None)
-        if items is not None:
-            return len(items)
-        return 0
 
     def _collect_error_logs(self) -> list[dict[str, Any]]:
         """Liest die juengsten ERROR/CRITICAL-Eintraege aus HAs system_log (#65).
@@ -786,9 +789,10 @@ class StateReporter:
         diese Methode liefert nur den Anzeige-Snapshot.
 
         Pro Entity wird gemeldet:
-        - ``kind`` ∈ {core, os, supervisor, addon, integration} — abgeleitet in
+        - ``kind`` ∈ {core, os, supervisor, addon, integration, device} — abgeleitet in
           :meth:`_classify_update` (feste System-Entity-IDs; Add-on am entity_picture;
-          alles uebrige = Integration, faktisch HACS/Custom).
+          Geraete-Firmware an ``device_class=="firmware"``; alles uebrige = Integration,
+          faktisch HACS/Custom).
         - ``slug`` — nur bei Add-ons (aus dem entity_picture), fuers Matching mit
           ``addons[]``; sonst ``None``.
         - ``update_available`` — HA-Konvention: State ``"on"`` = Update verfuegbar.
@@ -803,7 +807,11 @@ class StateReporter:
             try:
                 attrs = getattr(st, "attributes", None) or {}
                 entity_id = st.entity_id
-                kind, slug = self._classify_update(entity_id, attrs.get("entity_picture"))
+                kind, slug = self._classify_update(
+                    entity_id,
+                    attrs.get("entity_picture"),
+                    attrs.get("device_class"),
+                )
                 result.append(
                     {
                         "entity_id": entity_id,
@@ -832,15 +840,21 @@ class StateReporter:
 
     @staticmethod
     def _classify_update(
-        entity_id: str, entity_picture: Any
+        entity_id: str, entity_picture: Any, device_class: Any = None
     ) -> tuple[str, str | None]:
         """Leitet ``(kind, slug)`` einer ``update.*``-Entity ab.
 
         - HA Core/OS/Supervisor: feste Entity-IDs (:data:`_SYSTEM_UPDATE_KINDS`).
         - Add-on: ``entity_picture`` == ``/api/hassio/addons/<slug>/icon`` →
           ``("addon", slug)``.
+        - Geraete-Firmware: ``device_class == "firmware"`` → ``("device", None)``.
+          Shelly/ZHA/ESPHome/Tuya legen pro Geraet eine update-Entity fuer die
+          *Geraete-Firmware* an — das ist KEINE Integration (read-only in der UI).
         - sonst: ``("integration", None)`` — faktisch HACS/Custom, da Core-
           Integrationen keine eigene update-Entity fuehren (Research §4).
+
+        Reihenfolge ist sicher: die vier Quellen sind disjunkt (System-Entities,
+        Add-ons und Geraete-Firmware tragen jeweils ihren eigenen, exklusiven Marker).
         """
         system_kind = _SYSTEM_UPDATE_KINDS.get(entity_id)
         if system_kind is not None:
@@ -849,4 +863,9 @@ class StateReporter:
             match = _ADDON_PICTURE_RE.search(entity_picture)
             if match:
                 return "addon", match.group("slug")
+        if (
+            isinstance(device_class, str)
+            and device_class.lower() == _UPDATE_DEVICE_CLASS_FIRMWARE
+        ):
+            return "device", None
         return "integration", None

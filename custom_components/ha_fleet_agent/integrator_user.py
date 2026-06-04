@@ -116,19 +116,57 @@ class IntegratorUserManager:
         await self._create_user()
 
     async def _create_user(self) -> None:
-        password = secrets.token_urlsafe(24)
-        user = await self._hass.auth.async_create_user(
-            name=INTEGRATOR_USER_NAME,
-            group_ids=["system-admin"],
-            local_only=False,
-        )
+        """Legt den Wartungs-User an — oder uebernimmt einen bereits vorhandenen.
 
+        Findet sich im `homeassistant`-Auth-Provider schon ein Eintrag fuer
+        INTEGRATOR_USERNAME (etwa nach einem Plugin-Reinstall mit neuer entry_id
+        oder einem verlorenen lokalen Store, der HA-User selbst aber noch da),
+        wuerde ``add_auth`` mit ``InvalidUsername: username_already_exists``
+        abbrechen — genau der Fehler nach dem HACS-Update. Wir erkennen den Fall
+        vorab und rotieren dann nur das Passwort, statt einen zweiten User
+        anzulegen. Sonst haeuften sich bei jedem Reload Karteileichen und der
+        Tunnel bekaeme nie wieder gueltige Credentials.
+        """
         provider = self._hass.auth.get_auth_provider(_HA_AUTH_PROVIDER_TYPE, None)
         if provider is None:
             raise RuntimeError(
                 "Kein 'homeassistant'-Auth-Provider verfuegbar — Wartungs-User "
                 "kann ohne Username/Passwort-Anmeldung nicht genutzt werden."
             )
+
+        password = secrets.token_urlsafe(24)
+
+        if self._auth_entry_exists(provider):
+            user = await self._reuse_integrator_login(provider, password)
+        else:
+            user = await self._create_integrator_login(provider, password)
+
+        self._credentials = IntegratorCredentials(
+            user_id=user.id,
+            username=INTEGRATOR_USERNAME,
+            password=password,
+        )
+        await self._store.async_save({"user_id": user.id, "password": password})
+
+    def _auth_entry_exists(self, provider: Any) -> bool:
+        """True, wenn der `homeassistant`-Provider den Integrator-Username kennt.
+
+        Vergleicht normalisiert (HA speichert Usernamen ge-casefold-et), damit
+        der Check genau das trifft, woran ``add_auth`` scheitern wuerde.
+        """
+        normalize = provider.data.normalize_username
+        target = normalize(INTEGRATOR_USERNAME)
+        return any(
+            normalize(entry["username"]) == target for entry in provider.data.users
+        )
+
+    async def _create_integrator_login(self, provider: Any, password: str) -> Any:
+        """Erstinstallation: User + Auth-Eintrag komplett neu anlegen."""
+        user = await self._hass.auth.async_create_user(
+            name=INTEGRATOR_USER_NAME,
+            group_ids=["system-admin"],
+            local_only=False,
+        )
         # `add_auth` ist synchron, `async_save` persistiert in `.storage/auth_provider…`.
         await self._hass.async_add_executor_job(
             provider.data.add_auth, INTEGRATOR_USERNAME, password
@@ -140,18 +178,51 @@ class IntegratorUserManager:
             {"username": INTEGRATOR_USERNAME}
         )
         await self._hass.auth.async_link_user(user, credentials)
-
-        self._credentials = IntegratorCredentials(
-            user_id=user.id,
-            username=INTEGRATOR_USERNAME,
-            password=password,
-        )
-        await self._store.async_save(
-            {"user_id": user.id, "password": password}
-        )
         _LOGGER.info(
             "Wartungs-User '%s' angelegt (user_id=%s)", INTEGRATOR_USERNAME, user.id
         )
+        return user
+
+    async def _reuse_integrator_login(self, provider: Any, password: str) -> Any:
+        """Vorhandenen Integrator-Login uebernehmen: Passwort rotieren.
+
+        Das alte Passwort ist ohne den lokalen Store nicht mehr bekannt, also
+        setzt ``change_password`` ein neues. Existiert noch der verknuepfte
+        HA-User, wird er wiederverwendet; ist der Auth-Eintrag verwaist (kein
+        User mehr verknuepft), legen wir den User nach und binden ihn an die
+        vorhandenen Credentials.
+        """
+        await self._hass.async_add_executor_job(
+            provider.data.change_password, INTEGRATOR_USERNAME, password
+        )
+        await provider.data.async_save()
+
+        credentials = await provider.async_get_or_create_credentials(
+            {"username": INTEGRATOR_USERNAME}
+        )
+        user = await self._hass.auth.async_get_user_by_credentials(credentials)
+        if user is not None:
+            _LOGGER.info(
+                "Bestehenden Wartungs-User '%s' uebernommen, Passwort rotiert "
+                "(user_id=%s)",
+                INTEGRATOR_USERNAME,
+                user.id,
+            )
+            return user
+
+        user = await self._hass.auth.async_create_user(
+            name=INTEGRATOR_USER_NAME,
+            group_ids=["system-admin"],
+            local_only=False,
+        )
+        await self._hass.auth.async_link_user(user, credentials)
+        _LOGGER.info(
+            "Verwaisten Integrator-Auth-Eintrag an neuen User '%s' gebunden "
+            "(user_id=%s)",
+            INTEGRATOR_USERNAME,
+            user.id,
+        )
+        return user
 
     async def async_remove(self, keep_user: bool) -> None:
         """Entfernt den Wartungs-User (sofern `keep_user` False)."""

@@ -513,6 +513,24 @@ def test_list_updates_integration_ist_default():
     assert entry["slug"] is None
 
 
+def test_list_updates_geraete_firmware_kind_device():
+    """device_class=firmware → kind=device (Geraete-Firmware, read-only, KEINE Integration)."""
+    state = _FakeState(
+        "update.licht_buero_marija_firmware",
+        "on",
+        {
+            "title": "Licht Büro Marija firmware",
+            "installed_version": "1.7.4",
+            "latest_version": "1.7.5",
+            "device_class": "firmware",
+        },
+    )
+    entry = _updates_reporter([state])._list_updates()[0]
+    assert entry["kind"] == "device"
+    assert entry["slug"] is None
+    assert entry["update_available"] is True
+
+
 def test_list_updates_fehlende_attribute_defensiv():
     """Leere Attribute: title faellt auf entity_id, Versionen None, feat=0, in_progress False."""
     state = _FakeState("update.something", "off", {})
@@ -551,20 +569,28 @@ def test_list_updates_ueberspringt_kaputte_states():
 
 
 @pytest.mark.parametrize(
-    ("entity_id", "picture", "expected"),
+    ("entity_id", "picture", "device_class", "expected"),
     [
-        ("update.home_assistant_core_update", None, ("core", None)),
-        ("update.home_assistant_operating_system_update", None, ("os", None)),
-        ("update.home_assistant_supervisor_update", None, ("supervisor", None)),
-        ("update.terminal_ssh_update", "/api/hassio/addons/core_ssh/icon", ("addon", "core_ssh")),
-        ("update.vscode_update", "/api/hassio/addons/a0d7b954_vscode/icon?token=x", ("addon", "a0d7b954_vscode")),
-        ("update.frigate_update", "/api/frigate/notifications/thumb.jpg", ("integration", None)),
-        ("update.hacs_update", None, ("integration", None)),
+        ("update.home_assistant_core_update", None, None, ("core", None)),
+        ("update.home_assistant_operating_system_update", None, None, ("os", None)),
+        ("update.home_assistant_supervisor_update", None, None, ("supervisor", None)),
+        ("update.terminal_ssh_update", "/api/hassio/addons/core_ssh/icon", None, ("addon", "core_ssh")),
+        ("update.vscode_update", "/api/hassio/addons/a0d7b954_vscode/icon?token=x", None, ("addon", "a0d7b954_vscode")),
+        ("update.frigate_update", "/api/frigate/notifications/thumb.jpg", None, ("integration", None)),
+        ("update.hacs_update", None, None, ("integration", None)),
+        # Geraete-Firmware (Shelly/ZHA/ESPHome/...): device_class=firmware → device, keine slug.
+        ("update.licht_buero_firmware", None, "firmware", ("device", None)),
+        ("update.sonoff_bewegungsmelder", None, "firmware", ("device", None)),
+        # Gross-/Kleinschreibung des device_class robust behandeln.
+        ("update.shelly_plus_smoke", None, "Firmware", ("device", None)),
+        # Vorrang-Regeln: feste System-ID und Add-on-Bild gewinnen gegen device_class.
+        ("update.home_assistant_core_update", None, "firmware", ("core", None)),
+        ("update.some_addon", "/api/hassio/addons/core_xy/icon", "firmware", ("addon", "core_xy")),
     ],
 )
-def test_classify_update(entity_id, picture, expected):
-    """(kind, slug)-Ableitung: feste IDs, Add-on-Bild, sonst Integration."""
-    assert StateReporter._classify_update(entity_id, picture) == expected
+def test_classify_update(entity_id, picture, device_class, expected):
+    """(kind, slug)-Ableitung: feste IDs, Add-on-Bild, Geraete-Firmware, sonst Integration."""
+    assert StateReporter._classify_update(entity_id, picture, device_class) == expected
 
 
 @pytest.mark.asyncio
@@ -1033,11 +1059,14 @@ async def test_payload_enthaelt_error_logs_und_errors_count():
     assert len(payload["warning_logs"]) == 1
     assert payload["warning_logs"][0]["level"] == "WARNING"
     assert payload["warning_logs"][0]["source"] == "mqtt"
+    # warnings-Zaehler ist exakt die Laenge der Warnungs-Liste (analog zu errors),
+    # nicht mehr die Zahl der Persistent Notifications.
+    assert payload["warnings"] == len(payload["warning_logs"]) == 1
 
 
 @pytest.mark.asyncio
 async def test_errors_ist_null_ohne_fehler_logs():
-    """Ohne system_log-Komponente: errors = 0, error_logs = []."""
+    """Ohne system_log-Komponente: errors = 0, error_logs = [], warnings = 0."""
     session = FakeSession(response_status=200)
     hass = FakeHass()
     hass.config.version = "2026.5.0"
@@ -1052,3 +1081,6 @@ async def test_errors_ist_null_ohne_fehler_logs():
     assert payload["errors"] == 0
     assert payload["error_logs"] == []
     assert payload["warning_logs"] == []
+    # Keine WARNING-Logs ⇒ warnings-Zaehler 0 (kein Badge), auch wenn HA offene
+    # Persistent Notifications wie "Update verfuegbar" hat — die zaehlen nicht mehr.
+    assert payload["warnings"] == 0
