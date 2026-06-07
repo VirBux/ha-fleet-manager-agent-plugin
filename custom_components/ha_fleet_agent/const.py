@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -30,6 +30,16 @@ LANGUAGE_LABELS = {"de": "Deutsch", "en": "English"}
 # Intervalle
 STATE_UPDATE_INTERVAL_SECONDS = 60
 POLL_INTERVAL_SECONDS = 15
+
+# Reconnect nach unerwartetem Tunnel-Abriss (#108 Phase C).
+# Bricht der Tunnel weg, OBWOHL die Wartungs-Session noch laeuft (z.B. geplanter
+# Connector-Neustart), stoesst das Plugin sofort einen Re-Poll an statt bis zu
+# 15 s zu warten. Der Backoff verdoppelt sich pro Fehlversuch bis zum Cap; der
+# regulaere 15-s-Poll bleibt Fallback. Begrenzt durch MAX_ATTEMPTS, damit ein
+# dauerhaft toter Connector keinen Endlos-Loop erzeugt.
+RECONNECT_INITIAL_DELAY_SECONDS = 2
+RECONNECT_MAX_DELAY_SECONDS = 30
+RECONNECT_MAX_ATTEMPTS = 8
 
 # Erfassung kritischer Logs aus HAs system_log (#65).
 # system_log haelt selbst nur ~50 Eintraege (WARNING+) im RAM; wir kappen die

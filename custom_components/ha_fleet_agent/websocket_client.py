@@ -48,6 +48,10 @@ class FleetWebSocketClient:
 
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._read_task: asyncio.Task | None = None
+        # Guard gegen parallele Aufbauten (#108): waehrend `await ws_connect` laeuft,
+        # ist self._ws noch None — ohne dieses Flag koennten der regulaere 15-s-Poll
+        # und der Reconnect-Loop zwei WS-Verbindungen gleichzeitig oeffnen.
+        self._connecting = False
 
         # Registrierte Handler für eingehende Frames
         self._handlers: dict[str, MessageHandler] = {}
@@ -72,7 +76,7 @@ class FleetWebSocketClient:
     # --------------------------------------------------------- Verbindung
 
     async def connect_for_tunnel(
-        self, tunnel_token: str, connector_url: str
+        self, tunnel_token: str, connector_url: str, slug: str | None = None
     ) -> None:
         """Baut die WS-Verbindung zum Connector auf und startet die Read-Loop.
 
@@ -81,50 +85,70 @@ class FleetWebSocketClient:
         Alternativ kann tunnel_token separat übergeben werden — dann wird er
         als Query-Parameter an connector_url angehängt (falls noch kein
         `token=`-Parameter enthalten ist).
+
+        slug: optionaler Wunsch-Slug (Phase D — stabiler Slug). Wird als
+        `&slug=<slug>` an die URL gehängt, damit ein Reconnect dieselbe
+        Tunnel-URL bekommt. Ein älterer Connector ignoriert den Parameter und
+        würfelt wie bisher; autoritativ bleibt der Slug aus dem tunnel_open-Frame.
         """
         if self._ws is not None and not self._ws.closed:
             _LOGGER.warning(
                 "connect_for_tunnel aufgerufen, aber WS bereits aktiv — ignoriert"
             )
             return
+        if self._connecting:
+            # Paralleler Aufbau (z.B. regulärer Poll + Reconnect-Loop gleichzeitig):
+            # während self._session.ws_connect() awaitet, ist self._ws noch None.
+            # Ohne diesen Guard entstünden zwei WS-Verbindungen (#108).
+            _LOGGER.debug("connect_for_tunnel läuft bereits — paralleler Aufbau ignoriert")
+            return
 
-        # Token als Query-Param anhängen, falls noch nicht in der URL enthalten
-        if tunnel_token and "token=" not in connector_url:
-            sep = "&" if "?" in connector_url else "?"
-            connector_url = f"{connector_url}{sep}token={tunnel_token}"
-
-        # HTTP/2 explizit ausschließen — WebSocket-Upgrade ist HTTP/1.1-only (RFC 6455).
-        # ssl.create_default_context() blockiert (load_default_certs + set_default_verify_paths)
-        # und darf daher nicht im Event-Loop laufen. Wir erzeugen den Context einmal
-        # im Executor und cachen ihn pro Client-Instanz.
-        ssl_ctx: ssl.SSLContext | None = None
-        if connector_url.startswith("wss://"):
-            if self._ssl_ctx is None:
-                self._ssl_ctx = await self._hass.async_add_executor_job(
-                    self._build_ssl_context
-                )
-            ssl_ctx = self._ssl_ctx
-
-        _LOGGER.info("Tunnel-WS verbindet: %s", connector_url.split("?")[0])  # Token nicht loggen
+        self._connecting = True
         try:
-            # heartbeat=30s: sendet automatisch Ping-Frames und erwartet Pongs.
-            # Notwendig, damit Traefik die WS-Verbindung nicht nach 180s Idle abreißt
-            # (Default-idleTimeout). Ohne Heartbeat stirbt der Tunnel nach ~3 Minuten
-            # ohne Traffic, ohne dass das Plugin etwas merkt.
-            self._ws = await self._session.ws_connect(
-                connector_url,
-                ssl=ssl_ctx,
-                heartbeat=30,
-                timeout=aiohttp.ClientWSTimeout(ws_close=10.0),
-            )
-        except Exception as err:
-            _LOGGER.warning("WS-Verbindung zum Connector fehlgeschlagen: %s", err)
-            raise
+            # Token als Query-Param anhängen, falls noch nicht in der URL enthalten
+            if tunnel_token and "token=" not in connector_url:
+                sep = "&" if "?" in connector_url else "?"
+                connector_url = f"{connector_url}{sep}token={tunnel_token}"
 
-        # Read-Loop als Background-Task starten — blockiert nicht den Aufrufer
-        self._read_task = self._hass.async_create_background_task(
-            self._read_loop(), f"ha_fleet_agent_ws_tunnel_{self._entry_id}"
-        )
+            # Wunsch-Slug anhängen (Phase D), falls vorhanden und noch nicht enthalten.
+            if slug and "slug=" not in connector_url:
+                sep = "&" if "?" in connector_url else "?"
+                connector_url = f"{connector_url}{sep}slug={slug}"
+
+            # HTTP/2 explizit ausschließen — WebSocket-Upgrade ist HTTP/1.1-only (RFC 6455).
+            # ssl.create_default_context() blockiert (load_default_certs + set_default_verify_paths)
+            # und darf daher nicht im Event-Loop laufen. Wir erzeugen den Context einmal
+            # im Executor und cachen ihn pro Client-Instanz.
+            ssl_ctx: ssl.SSLContext | None = None
+            if connector_url.startswith("wss://"):
+                if self._ssl_ctx is None:
+                    self._ssl_ctx = await self._hass.async_add_executor_job(
+                        self._build_ssl_context
+                    )
+                ssl_ctx = self._ssl_ctx
+
+            _LOGGER.info("Tunnel-WS verbindet: %s", connector_url.split("?")[0])  # Token nicht loggen
+            try:
+                # heartbeat=30s: sendet automatisch Ping-Frames und erwartet Pongs.
+                # Notwendig, damit Traefik die WS-Verbindung nicht nach 180s Idle abreißt
+                # (Default-idleTimeout). Ohne Heartbeat stirbt der Tunnel nach ~3 Minuten
+                # ohne Traffic, ohne dass das Plugin etwas merkt.
+                self._ws = await self._session.ws_connect(
+                    connector_url,
+                    ssl=ssl_ctx,
+                    heartbeat=30,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=10.0),
+                )
+            except Exception as err:
+                _LOGGER.warning("WS-Verbindung zum Connector fehlgeschlagen: %s", err)
+                raise
+
+            # Read-Loop als Background-Task starten — blockiert nicht den Aufrufer
+            self._read_task = self._hass.async_create_background_task(
+                self._read_loop(), f"ha_fleet_agent_ws_tunnel_{self._entry_id}"
+            )
+        finally:
+            self._connecting = False
 
     async def disconnect(self) -> None:
         """Schließt die WS-Verbindung sauber."""

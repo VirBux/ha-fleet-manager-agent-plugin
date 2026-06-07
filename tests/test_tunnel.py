@@ -9,7 +9,11 @@ from typing import Any
 import pytest
 
 from ha_fleet_agent import const
-from ha_fleet_agent.tunnel import TunnelForwarder
+from ha_fleet_agent.tunnel import (
+    CLOSE_INTENT_END,
+    CLOSE_INTENT_HANDOVER,
+    TunnelForwarder,
+)
 
 
 # --------------------------------------------------------- Stubs
@@ -306,6 +310,29 @@ async def test_tunnel_open_postet_credentials_per_rest(make_forwarder):
 
 
 @pytest.mark.asyncio
+async def test_tunnel_open_slug_ist_autoritaet_fuer_credentials(make_forwarder):
+    """Phase D (#108): Der Slug aus tunnel_open (real vom Connector vergeben) ist
+    Autorität für den Credentials-POST → das Backend lernt den real vergebenen Slug
+    (Selbstkorrektur, falls der Connector einen anderen als den vorgegebenen würfelte)."""
+    rest_calls: list[dict] = []
+
+    def rest_handler(call):
+        rest_calls.append(call)
+        return _FakeResponse(204, b"", {})
+
+    fwd, _, http_session, _ = make_forwarder(
+        credentials=FakeCredentials(password="pw"),
+        rest_handler=rest_handler,
+    )
+
+    await fwd._on_tunnel_open({"tunnelId": "abc12345"})  # Connector vergab abc12345
+
+    post = next(c for c in http_session.rest_calls if c["method"] == "POST")
+    assert "/api/agent/tunnels/abc12345/credentials" in post["url"]
+    assert fwd._active_tunnel_slug == "abc12345"
+
+
+@pytest.mark.asyncio
 async def test_tunnel_open_ohne_credentials_kein_rest_post(make_forwarder):
     """Ohne Credentials-Objekt soll kein REST-POST versucht werden
     (capabilities-Frame geht trotzdem raus)."""
@@ -336,8 +363,8 @@ async def test_tunnel_open_mit_user_fehler_kein_rest_post(make_forwarder):
 
 
 @pytest.mark.asyncio
-async def test_tunnel_closed_sendet_delete_credentials(make_forwarder):
-    """Wenn der Connector die Verbindung trennt, soll DELETE Credentials gesendet werden."""
+async def test_intentional_close_sendet_delete_credentials(make_forwarder):
+    """GEWOLLTER Close (END-Intent) → DELETE Credentials + on_close (#108 Phase C)."""
     rest_calls: list[dict] = []
 
     def rest_handler(call):
@@ -350,16 +377,109 @@ async def test_tunnel_closed_sendet_delete_credentials(make_forwarder):
     )
     # Slug simulieren (normalerweise durch _on_tunnel_open gesetzt)
     fwd._active_tunnel_slug = "abc12345"
+    fwd._close_intent = CLOSE_INTENT_END
 
-    # Disconnect-Callback manuell triggern
     fwd._on_tunnel_closed()
-
-    # Task abwarten
     await asyncio.gather(*hass._tasks, return_exceptions=True)
 
     delete_calls = [c for c in http_session.rest_calls if c["method"] == "DELETE"]
     assert len(delete_calls) == 1
     assert "/api/agent/tunnels/abc12345/credentials" in delete_calls[0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_unerwarteter_abriss_kein_delete_sondern_reconnect(make_forwarder):
+    """Unerwarteter Abriss (Default RECONNECT) → KEIN DELETE (sonst CLOSED →
+    kein Reconnect), stattdessen Reconnect-Callback + Session bleibt (#108 Phase C)."""
+    rest_calls: list[dict] = []
+
+    def rest_handler(call):
+        rest_calls.append(call)
+        return _FakeResponse(204, b"", {})
+
+    close_calls: list[str] = []
+    reconnect_calls: list[int] = []
+
+    async def on_close():
+        close_calls.append("called")
+
+    ws_client = FakeWsClient()
+    user = FakeIntegratorUser(FakeCredentials())
+    hass = FakeHass()
+    http_session = FakeHttpSession(rest_handler=rest_handler)
+    fwd = TunnelForwarder(
+        hass, ws_client, user,
+        backend_url="https://api.ha-fleet-manager.com",
+        api_key="test-api-key-1234567890",
+        http_session=http_session,
+        on_close=on_close,
+    )
+    fwd.set_reconnect_callback(lambda: reconnect_calls.append(1))
+    fwd._active_tunnel_slug = "abc12345"
+    # Kein _close_intent gesetzt → Default RECONNECT (unerwarteter Abriss).
+
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    delete_calls = [c for c in http_session.rest_calls if c["method"] == "DELETE"]
+    assert delete_calls == [], "Bei unerwartetem Abriss darf KEIN DELETE feuern"
+    assert close_calls == [], "Session darf bei unerwartetem Abriss NICHT enden"
+    assert reconnect_calls == [1], "Reconnect-Callback muss gefeuert werden"
+
+
+@pytest.mark.asyncio
+async def test_handover_close_delete_aber_kein_session_ende_kein_reconnect(make_forwarder):
+    """HANDOVER (neue Anfrage ersetzt Tunnel) → DELETE alten Slug, aber WEDER
+    Session beenden NOCH Reconnect (#108 Phase C)."""
+    rest_calls: list[dict] = []
+
+    def rest_handler(call):
+        rest_calls.append(call)
+        return _FakeResponse(204, b"", {})
+
+    close_calls: list[str] = []
+    reconnect_calls: list[int] = []
+
+    async def on_close():
+        close_calls.append("called")
+
+    ws_client = FakeWsClient()
+    user = FakeIntegratorUser(FakeCredentials())
+    hass = FakeHass()
+    http_session = FakeHttpSession(rest_handler=rest_handler)
+    fwd = TunnelForwarder(
+        hass, ws_client, user,
+        backend_url="https://api.ha-fleet-manager.com",
+        api_key="test-api-key-1234567890",
+        http_session=http_session,
+        on_close=on_close,
+    )
+    fwd.set_reconnect_callback(lambda: reconnect_calls.append(1))
+    fwd._active_tunnel_slug = "abc12345"
+    fwd.mark_handover_close()
+
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    delete_calls = [c for c in http_session.rest_calls if c["method"] == "DELETE"]
+    assert len(delete_calls) == 1, "Handover räumt den alten Slug am Backend ab"
+    assert close_calls == [], "Handover darf die (neue) Session nicht beenden"
+    assert reconnect_calls == [], "Handover darf keinen Reconnect auslösen"
+
+
+@pytest.mark.asyncio
+async def test_close_intent_wird_nach_close_zurueckgesetzt(make_forwarder):
+    """Nach einem END-Close steht der Intent wieder auf RECONNECT (nächster
+    unerwarteter Abriss verhält sich korrekt)."""
+    fwd, _, _, hass = make_forwarder()
+    fwd._active_tunnel_slug = "abc12345"
+    fwd._close_intent = CLOSE_INTENT_END
+
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    from ha_fleet_agent.tunnel import CLOSE_INTENT_RECONNECT
+    assert fwd._close_intent == CLOSE_INTENT_RECONNECT
 
 
 # --------------------------------------------------------- Tests: HTTP-Forwarding

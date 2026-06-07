@@ -57,6 +57,18 @@ from .websocket_client import FleetWebSocketClient
 
 _LOGGER = logging.getLogger(__name__)
 
+# Close-Intent (#108 Phase C): wie der nächste Tunnel-Close zu behandeln ist.
+#   RECONNECT (Default): unerwarteter Abriss → Session bleibt, Reconnect anstoßen.
+#   END:                 Endkunde-Abbruch / Unload / Ablauf → DELETE-Credentials
+#                        + Wartungs-Session beenden (on_close).
+#   HANDOVER:            neue Anfrage ersetzt den laufenden Tunnel → DELETE des
+#                        alten Slugs, aber WEDER Session beenden NOCH Reconnect
+#                        (der connection_accepted-Handler baut den neuen Tunnel
+#                        selbst auf — ein Reconnect würde mit ihm kollidieren).
+CLOSE_INTENT_RECONNECT = "reconnect"
+CLOSE_INTENT_END = "end"
+CLOSE_INTENT_HANDOVER = "handover"
+
 # Headers, die wir an HA NICHT weiterreichen.
 _DROP_REQUEST_HEADERS = frozenset(
     {
@@ -122,9 +134,15 @@ class TunnelForwarder:
         self._api_key = api_key
         self._local_url = local_url.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
-        # Optionaler async-Callback, der beim Tunnel-Close zusätzlich gefeuert wird
+        # Optionaler async-Callback, der beim GEWOLLTEN Tunnel-Close gefeuert wird
         # (z.B. um die laufende Wartungs-Session zu beenden).
         self._on_close = on_close
+        # Reconnect-Callback (Phase C): bei UNERWARTETEM Tunnel-Abriss aufgerufen,
+        # um — sofern die Wartungs-Session noch laeuft — einen Re-Poll anzustossen.
+        self._reconnect: Callable[[], None] | None = None
+        # Intent fuer den naechsten Tunnel-Close (#108 Phase C). Default: ein
+        # Close ohne vorherige Markierung gilt als unerwarteter Abriss → Reconnect.
+        self._close_intent = CLOSE_INTENT_RECONNECT
 
         # Separate aiohttp-Session für HTTP-Forwards an localhost
         # (Trennung von der globalen Session für Backend-Calls)
@@ -135,6 +153,10 @@ class TunnelForwarder:
         self._active_tunnel_slug: str | None = None
         # Tunnel-Token des aktuellen Tunnels (für X-Tunnel-Token-Header beim Credentials-POST)
         self._active_tunnel_token: str | None = None
+        # requestId des aktuell laufenden Tunnels (Phase A — Idempotenz). Schuetzt gegen
+        # einen erneuten Tunnel-Aufbau, wenn das Backend fuer DIESELBE Anfrage nochmal
+        # connection_accepted liefert (z.B. nach Backend-Neustart mit leerem Tunnel-Cache).
+        self._active_request_id: str | None = None
 
         # In-flight HTTP-Forward-Tasks — werden bei stop() abgebrochen.
         self._pending: set[asyncio.Task] = set()
@@ -157,12 +179,39 @@ class TunnelForwarder:
         """Setzt den Tunnel-Token des aktuellen Tunnels (vom Poller übergeben)."""
         self._active_tunnel_token = token
 
+    def set_active_request_id(self, request_id: str | None) -> None:
+        """Merkt sich die requestId des laufenden Tunnels (Phase A — Idempotenz)."""
+        self._active_request_id = request_id or None
+
+    @property
+    def active_request_id(self) -> str | None:
+        """requestId des aktuell laufenden Tunnels (None, wenn keiner läuft)."""
+        return self._active_request_id
+
+    def set_reconnect_callback(self, callback: Callable[[], None]) -> None:
+        """Setzt den Callback, der bei unerwartetem Tunnel-Abriss feuert (Phase C)."""
+        self._reconnect = callback
+
+    def mark_handover_close(self) -> None:
+        """Markiert den nächsten Tunnel-Close als Handover (#108 Phase C).
+
+        Genutzt vom connection_accepted-Handler, wenn eine NEUE Anfrage den
+        laufenden Tunnel ersetzt: der alte Slug wird am Backend abgeräumt, aber
+        weder die (bereits neue) Wartungs-Session beendet noch ein Reconnect
+        ausgelöst — der Handler baut den neuen Tunnel direkt selbst auf."""
+        self._close_intent = CLOSE_INTENT_HANDOVER
+
     async def async_setup(self) -> None:
         """Keine eigene Session mehr nötig — http_session wird von außen übergeben."""
         pass
 
     async def async_shutdown(self) -> None:
-        """Bricht laufende Forwards/Pumps ab und schliesst alle offenen WS-Verbindungen."""
+        """Bricht laufende Forwards/Pumps ab und schliesst alle offenen WS-Verbindungen.
+
+        Plugin-Unload ist ein GEWOLLTER Close: der END-Intent sorgt dafür, dass
+        der anschließende ws_client.disconnect() in _on_tunnel_closed die Session
+        beendet (statt einen Reconnect anzustoßen)."""
+        self._close_intent = CLOSE_INTENT_END
         await self._cleanup_tunnel_resources()
 
     async def _cleanup_tunnel_resources(self) -> None:
@@ -258,21 +307,46 @@ class TunnelForwarder:
         await self._post_credentials(slug, credentials.username, credentials.password)
 
     def _on_tunnel_closed(self) -> None:
-        """WS-Verbindung wurde getrennt (vom Connector oder lokal) — Ressourcen
-        freigeben, DELETE Credentials, Session beenden."""
+        """WS-Verbindung wurde getrennt. Reagiert je nach Close-Intent (#108 Phase C):
+        END (Endkunde/Unload/Ablauf) → Credentials löschen + Session beenden;
+        HANDOVER (neue Anfrage) → nur Credentials des alten Slugs löschen;
+        RECONNECT (unerwarteter Abriss, Default) → Session NICHT beenden, Reconnect
+        anstoßen."""
+        intent = self._close_intent
+        self._close_intent = CLOSE_INTENT_RECONNECT  # für den nächsten Tunnel zurücksetzen
         slug = self._active_tunnel_slug
-        if slug:
+
+        # Credentials abräumen bei END und HANDOVER (alter Request wird im Backend
+        # CLOSED). Bei RECONNECT NICHT — der DELETE würde den ConnectionRequest auf
+        # CLOSED setzen und damit den Reconnect-Poll verhindern. (Beim graceful
+        # Connector-Shutdown invalidiert der Connector den Cache ohnehin per Notify.)
+        if intent in (CLOSE_INTENT_END, CLOSE_INTENT_HANDOVER) and slug:
             self._hass.async_create_task(self._delete_credentials(slug))
+
         self._active_tunnel_slug = None
         self._active_tunnel_token = None
-        # Verwaiste WS-Pumps + HA-WS-Verbindungen dieses Tunnels freigeben. Ohne
-        # das senden die Pumps nach dem Tunnel-Abbau weiter ueber die tote
-        # Tunnel-WS ('send_json ohne aktive WS-Verbindung') und leaken HA-WS +
-        # Tasks (ein Eintrag pro Browser-WebSocket, der ueber den Tunnel lief).
+        self._active_request_id = None
+        # Verwaiste WS-Pumps + HA-WS-Verbindungen dieses Tunnels freigeben (immer).
+        # Ohne das senden die Pumps nach dem Tunnel-Abbau weiter über die tote
+        # Tunnel-WS ('send_json ohne aktive WS-Verbindung') und leaken HA-WS + Tasks
+        # (ein Eintrag pro Browser-WebSocket, der über den Tunnel lief).
         self._hass.async_create_task(self._cleanup_tunnel_resources())
         self._publish_tunnel_state(False)
-        if self._on_close is not None:
-            self._hass.async_create_task(self._safe_on_close())
+
+        if intent == CLOSE_INTENT_END:
+            # Gewollter Close → Wartungs-Session beenden (wie bisher).
+            if self._on_close is not None:
+                self._hass.async_create_task(self._safe_on_close())
+        elif intent == CLOSE_INTENT_RECONNECT:
+            # Unerwarteter Abriss → Session NICHT beenden, Reconnect anstoßen.
+            # Der Reconnector prüft selbst, ob die Session noch offen ist.
+            _LOGGER.info(
+                "Tunnel unerwartet getrennt — Reconnect wird angestoßen (Session bleibt)"
+            )
+            if self._reconnect is not None:
+                self._reconnect()
+        # HANDOVER: nichts weiter — der connection_accepted-Handler baut den neuen
+        # Tunnel direkt selbst auf.
 
     async def _safe_on_close(self) -> None:
         try:
@@ -296,6 +370,8 @@ class TunnelForwarder:
             "Tunnel wird vom Endkunden geschlossen (slug=%s)",
             self._active_tunnel_slug or "?",
         )
+        # Endkunden-Abbruch ist ein GEWOLLTER Close → kein Reconnect, Session endet.
+        self._close_intent = CLOSE_INTENT_END
         await self._ws_client.disconnect()
         return True
 

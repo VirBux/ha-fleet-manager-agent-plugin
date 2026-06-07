@@ -49,6 +49,12 @@ class RequestPoller:
         self._endpoint = backend_url.rstrip("/") + "/api/agent/poll"
         self._api_key = api_key
         self._unsub_interval = None
+        # Reentrancy-Guard (#108): der reguläre 15-s-Tick und der Reconnect-Loop
+        # rufen beide _poll_once. Zwei parallele Polls würden zwei Tunnel-Token
+        # ausgeben — der zweite expired den ersten (expireExisting), bevor dessen
+        # WS-Aufbau fertig ist → der erste Tunnel-Connect scheitert mit 4001.
+        # Darum läuft immer nur ein Poll zur Zeit.
+        self._polling = False
 
         # Handler-Registry: action-Name → async Callable
         self._handlers: dict[str, ActionHandler] = {}
@@ -79,7 +85,22 @@ class RequestPoller:
         await self._poll_once()
 
     async def _poll_once(self) -> None:
-        """Führt einen einzelnen Poll durch und dispatcht ggf. die Aktion."""
+        """Führt einen einzelnen Poll durch — reentrancy-geschützt (#108).
+
+        Läuft bereits ein Poll (z.B. regulärer Tick), wird ein zweiter (z.B. vom
+        Reconnect-Loop) übersprungen, damit nicht zwei Tunnel-Token parallel
+        ausgegeben werden (der zweite würde den ersten via expireExisting entwerten)."""
+        if self._polling:
+            _LOGGER.debug("Poll läuft bereits — paralleler Poll übersprungen")
+            return
+        self._polling = True
+        try:
+            await self._do_poll()
+        finally:
+            self._polling = False
+
+    async def _do_poll(self) -> None:
+        """Eigentliche Poll-Logik — nur über _poll_once aufrufen (Reentrancy-Guard)."""
         headers = {"X-API-Key": self._api_key}
         timeout = aiohttp.ClientTimeout(total=10)
 

@@ -52,6 +52,7 @@ from .const import (
 from .dashboard import async_ensure_dashboard, async_remove_dashboard
 from .device import build_device_info
 from .integrator_user import IntegratorUserManager
+from .reconnect import TunnelReconnector
 from .remote_access import RemoteAccessManager
 from .request_poller import RequestPoller
 from .state_reporter import StateReporter
@@ -65,6 +66,7 @@ DATA_TUNNEL_FORWARDER = "tunnel_forwarder"
 DATA_STATE_REPORTER = "state_reporter"
 DATA_REQUEST_POLLER = "request_poller"
 DATA_UPDATE_HANDLER = "update_handler"
+DATA_RECONNECTOR = "reconnector"
 DATA_HTTP_SESSION = "http_session"
 
 # Config-Option: User bei Plugin-Deinstallation behalten?
@@ -242,6 +244,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         api_key=api_key,
     )
 
+    # Reconnector (#108 Phase C): stößt nach unerwartetem Tunnel-Abriss einen
+    # sofortigen Re-Poll an (statt bis zu 15 s zu warten) — der reguläre
+    # connection_accepted-Handler baut den Tunnel dann auf. Greift nur, solange
+    # die Wartungs-Session noch läuft; der 15-s-Poll bleibt Fallback.
+    async def _reconnect_gave_up() -> None:
+        await remote_access.async_end_session(reason="reconnect_failed")
+
+    reconnector = TunnelReconnector(
+        hass,
+        poll_once=request_poller._poll_once,
+        is_tunnel_up=lambda: ws_client.is_connected,
+        is_session_open=lambda: remote_access.session is not None,
+        on_give_up=_reconnect_gave_up,
+    )
+    tunnel_forwarder.set_reconnect_callback(reconnector.trigger)
+
     # Action-Handler beim Poller registrieren
     request_poller.register_handler(
         "connection_request", remote_access._on_connection_request
@@ -276,6 +294,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_TUNNEL_FORWARDER: tunnel_forwarder,
         DATA_STATE_REPORTER: state_reporter,
         DATA_REQUEST_POLLER: request_poller,
+        DATA_RECONNECTOR: reconnector,
         DATA_UPDATE_HANDLER: update_handler,
         DATA_DEVICE_INFO: build_device_info(entry.entry_id, backend_url),
     }
@@ -338,6 +357,8 @@ def _make_connection_accepted_handler(
         # Klick akzeptiert, kann noch ein Repair-Issue offenstehen — aufraeumen.
         await remote_access._on_poll_idle()
 
+        # requestId der Anfrage (camelCase vom Backend; snake_case-Fallback für Tests).
+        request_id: str = data.get("requestId") or data.get("request_id") or ""
         tunnel_token: str = data.get("tunnelToken") or data.get("tunnel_token") or ""
         # connectorUrl: vollständige WS-URL mit Token, vom Backend geliefert.
         # Falls nicht dabei, aus relay_url + Token ableiten.
@@ -346,6 +367,10 @@ def _make_connection_accepted_handler(
             or data.get("connector_url")
             or relay_url
         )
+        # Phase D: vom Backend vorgegebener stabiler Slug (optional). Sorgt nach
+        # einem Reconnect für die GLEICHE Tunnel-URL. Älteres Backend liefert ihn
+        # nicht — dann würfelt der Connector wie bisher.
+        slug: str = data.get("slug") or ""
 
         if not tunnel_token:
             _LOGGER.warning(
@@ -359,29 +384,49 @@ def _make_connection_accepted_handler(
             )
             return
 
-        # Falls noch eine alte WS aktiv ist (Tunnel wurde nicht ordentlich getrennt):
-        # erst sauber schließen, damit der Forwarder DELETE-Credentials für den alten
-        # Slug feuert und das Backend den alten ConnectionRequest auf CLOSED setzt.
-        # Erst DANACH den neuen Token setzen — der Disconnect-Callback würde ihn
-        # sonst sofort wieder auf "" zurücksetzen.
+        # Phase A — requestId-bewusste Idempotenz:
+        # Läuft bereits ein Tunnel für GENAU diese Anfrage, ist der Frame ein
+        # Duplikat (z.B. Backend-Neustart mit leerem Tunnel-Cache liefert erneut
+        # einen Token). Dann NICHT neu aufbauen — sonst kappt der Disconnect die
+        # laufende Sitzung ohne Grund.
         if ws_client.is_connected:
+            if request_id and request_id == tunnel_forwarder.active_request_id:
+                _LOGGER.debug(
+                    "connection_accepted für bereits laufenden Tunnel "
+                    "(request=%s) — ignoriert",
+                    request_id,
+                )
+                return
+            # Andere requestId → echte neue Anfrage: alte WS erst sauber schließen,
+            # damit der Forwarder DELETE-Credentials für den alten Slug feuert und
+            # das Backend den alten ConnectionRequest auf CLOSED setzt. Erst DANACH
+            # den neuen Zustand setzen — der Disconnect-Callback würde ihn sonst
+            # sofort wieder zurücksetzen.
+            # Handover markieren (#108 Phase C): der alte Tunnel-Close darf WEDER
+            # die (bereits neue) Wartungs-Session beenden NOCH einen Reconnect
+            # auslösen — diesen Aufbau übernehmen wir gleich selbst.
             _LOGGER.info(
                 "Neue Verbindungsanfrage — bestehende Tunnel-WS wird zuerst geschlossen"
             )
+            tunnel_forwarder.mark_handover_close()
             await ws_client.disconnect()
 
-        # Tunnel-Token im Forwarder hinterlegen (für Credentials-POST nach tunnel_open)
+        # Zustand des neuen Tunnels im Forwarder hinterlegen: Token für den
+        # Credentials-POST, requestId für die Idempotenz. Den Slug gibt der Connect
+        # direkt an den Connector weiter (autoritativ wird er dann via tunnel_open).
         tunnel_forwarder.set_active_tunnel_token(tunnel_token)
+        tunnel_forwarder.set_active_request_id(request_id)
 
         _LOGGER.info(
             "Verbindungsanfrage akzeptiert — baue Tunnel-WS auf (relay=%s)",
             connector_url.split("?")[0],  # Token nicht loggen
         )
         try:
-            await ws_client.connect_for_tunnel(tunnel_token, connector_url)
+            await ws_client.connect_for_tunnel(tunnel_token, connector_url, slug=slug)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Tunnel-WS-Verbindung fehlgeschlagen")
             tunnel_forwarder.set_active_tunnel_token("")
+            tunnel_forwarder.set_active_request_id(None)
 
     return _handler
 
@@ -398,6 +443,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     state_reporter: StateReporter | None = data.get(DATA_STATE_REPORTER)
     request_poller: RequestPoller | None = data.get(DATA_REQUEST_POLLER)
+    reconnector: TunnelReconnector | None = data.get(DATA_RECONNECTOR)
     remote_access: RemoteAccessManager | None = data.get(DATA_REMOTE_ACCESS)
     tunnel_forwarder: TunnelForwarder | None = data.get(DATA_TUNNEL_FORWARDER)
     ws_client: FleetWebSocketClient | None = data.get(DATA_CLIENT)
@@ -408,6 +454,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         state_reporter.stop()
     if request_poller is not None:
         request_poller.stop()
+    # Reconnect-Loop stoppen, bevor der Tunnel-Forwarder schließt (sonst könnte ein
+    # laufender Loop noch pollen, während alles abgebaut wird) — #108 Phase C.
+    if reconnector is not None:
+        reconnector.cancel()
     if remote_access is not None:
         await remote_access.async_shutdown()
     if tunnel_forwarder is not None:

@@ -226,6 +226,47 @@ async def test_200_ohne_action_feld_kein_crash():
 
 
 @pytest.mark.asyncio
+async def test_poll_reentrancy_guard_ueberspringt_parallelen_poll():
+    """#108: Läuft ein Poll bereits, wird ein zweiter (z.B. vom Reconnect-Loop)
+    übersprungen — sonst gäbe es zwei parallele Token-Ausgaben."""
+
+    class _SlowResponse:
+        def __init__(self, gate):
+            self._gate = gate
+            self.status = 204
+
+        async def __aenter__(self):
+            await self._gate.wait()
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _SlowSession:
+        def __init__(self, gate):
+            self._gate = gate
+            self.calls = 0
+
+        def get(self, url, headers=None, timeout=None):
+            self.calls += 1
+            return _SlowResponse(self._gate)
+
+    gate = asyncio.Event()
+    session = _SlowSession(gate)
+    hass = FakeHass()
+    poller = RequestPoller(hass, session, "https://api.ha-fleet-manager.com", "key")
+
+    t1 = asyncio.get_event_loop().create_task(poller._poll_once())
+    await asyncio.sleep(0)  # ersten Poll bis zum GET-await bringen
+    await poller._poll_once()  # zweiter Poll → Guard greift
+    assert session.calls == 1, "Zweiter paralleler Poll darf kein zweites GET feuern"
+
+    gate.set()
+    await t1
+    assert session.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_204_dispatcht_idle_action():
     """HTTP 204 → synthetische 'idle'-Aktion (#90, Self-Healing-Hook).
 
