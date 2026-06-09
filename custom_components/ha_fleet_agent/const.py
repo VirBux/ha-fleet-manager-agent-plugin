@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -30,6 +30,19 @@ LANGUAGE_LABELS = {"de": "Deutsch", "en": "English"}
 # Intervalle
 STATE_UPDATE_INTERVAL_SECONDS = 60
 POLL_INTERVAL_SECONDS = 15
+
+# CPU-Sampling-Fenster fuer psutil.cpu_percent(interval=...).
+# Bewusst eine BLOCKIERENDE Messung ueber ein eigenes 5-s-Fenster statt des
+# frueheren interval=None. Letzteres misst die CPU-Last "seit dem letzten
+# psutil.cpu_percent()-Aufruf" — und dieser Referenzpunkt ist PROZESSWEIT
+# geteilt. Andere psutil-Nutzer im selben HA-Prozess (v.a. die systemmonitor-
+# Integration) setzen ihn staendig zurueck, sodass unser 60-s-State-Tick
+# faktisch nur ein Mini-Intervall maß und zufaellig in einen lastfreien Moment
+# fallen konnte — die Anzeige sprang dann auf ~1 % trotz realer Last.
+# interval=5.0 nimmt eigene Start-/Endpunkte und liefert den echten Mittelwert
+# ueber genau 5 s (immun gegen Fremdaufrufe, kein "erster Aufruf = 0.0").
+# Laeuft im Executor-Thread (run_in_executor), blockiert den Event-Loop nicht.
+CPU_SAMPLE_INTERVAL_SECONDS = 5.0
 
 # Reconnect nach unerwartetem Tunnel-Abriss (#108 Phase C).
 # Bricht der Tunnel weg, OBWOHL die Wartungs-Session noch laeuft (z.B. geplanter
@@ -128,7 +141,7 @@ SIGNAL_TUNNEL_STATE = f"{DOMAIN}_tunnel_state"
 # Fernzugriff
 DEFAULT_PREAUTH_MAX_HOURS = 4
 DEFAULT_PREAUTH_VALIDITY_HOURS = 8
-MAX_SESSION_HOURS = 12
+MAX_SESSION_HOURS = 720  # 30 Tage (30 * 24 h) — Obergrenze fuer Tunnel-/Sitzungsdauer
 MAX_PREAUTH_VALIDITY_HOURS = 168  # 7 Tage
 
 # Konfigurations-Storage-Keys

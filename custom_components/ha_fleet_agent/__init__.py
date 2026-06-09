@@ -49,6 +49,7 @@ from .const import (
     DATA_REMOTE_ACCESS,
     DOMAIN,
 )
+from .clear_logs_handler import ClearLogsHandler
 from .dashboard import async_ensure_dashboard, async_remove_dashboard
 from .device import build_device_info
 from .integrator_user import IntegratorUserManager
@@ -66,6 +67,7 @@ DATA_TUNNEL_FORWARDER = "tunnel_forwarder"
 DATA_STATE_REPORTER = "state_reporter"
 DATA_REQUEST_POLLER = "request_poller"
 DATA_UPDATE_HANDLER = "update_handler"
+DATA_CLEAR_LOGS_HANDLER = "clear_logs_handler"
 DATA_RECONNECTOR = "reconnector"
 DATA_HTTP_SESSION = "http_session"
 
@@ -209,6 +211,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         session=http_session,
         backend_url=backend_url,
         api_key=api_key,
+        integrator_user=integrator_user,
     )
     await remote_access.async_load()
 
@@ -283,6 +286,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         api_key=api_key,
     )
     request_poller.register_handler("update_batch", update_handler.handle)
+    # Log-Leeren (#109): das Backend liefert in ruhigen Ticks die Action
+    # "clear_logs", wenn der Integrator im Dashboard "Logs leeren" geklickt hat.
+    # Der Handler ruft system_log.clear und stoesst danach einen sofortigen
+    # State-Push an (frischer, leerer Log-Snapshot ohne Wartezeit).
+    clear_logs_handler = ClearLogsHandler(hass, state_reporter)
+    request_poller.register_handler("clear_logs", clear_logs_handler.handle)
 
     hass.data[DOMAIN][entry.entry_id] = {
         CONF_API_KEY: api_key,
@@ -296,6 +305,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_REQUEST_POLLER: request_poller,
         DATA_RECONNECTOR: reconnector,
         DATA_UPDATE_HANDLER: update_handler,
+        DATA_CLEAR_LOGS_HANDLER: clear_logs_handler,
         DATA_DEVICE_INFO: build_device_info(entry.entry_id, backend_url),
     }
 

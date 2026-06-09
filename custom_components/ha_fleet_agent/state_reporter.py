@@ -33,6 +33,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CPU_SAMPLE_INTERVAL_SECONDS,
     DOMAIN,
     ERROR_LOG_LEVELS,
     MAX_ERROR_LOG_MESSAGE_LEN,
@@ -107,6 +108,14 @@ class StateReporter:
         if self._unsub_interval is not None:
             self._unsub_interval()
             self._unsub_interval = None
+
+    async def push_now(self) -> None:
+        """Sendet sofort einen frischen State-Payload — ausserhalb des 60-s-Takts.
+
+        Genutzt nach einem fern ausgeloesten ``system_log.clear`` (#109), damit der
+        Backend-Snapshot ohne Wartezeit den nun leeren Log-Stand widerspiegelt.
+        """
+        await self._push_once()
 
     # --------------------------------------------------------- Intervall
 
@@ -329,6 +338,10 @@ class StateReporter:
         im Manifest verfügbar. Auf Container-Setups ohne /proc-Zugriff fällt
         die Funktion still auf None zurück.
 
+        CPU wird als **5-s-Mittelwert** erhoben (``psutil.cpu_percent(interval=
+        CPU_SAMPLE_INTERVAL_SECONDS)``), nicht als Momentaufnahme — Begruendung
+        siehe Inline-Kommentar in ``_read`` und REQUIREMENTS §5.2.
+
         Rückgabe: dict mit `cpu_percent` und `memory_percent` (jeweils float)
         oder None bei Fehler.
         """
@@ -339,9 +352,17 @@ class StateReporter:
             return None
 
         def _read() -> dict:
-            # interval=None: nicht-blockierend, Mittelwert seit letztem Aufruf.
-            # Erster Aufruf liefert daher 0.0 — beim 60s-Tick akzeptabel.
-            cpu = psutil.cpu_percent(interval=None)
+            # interval=CPU_SAMPLE_INTERVAL_SECONDS (5 s): BLOCKIERENDE Messung
+            # ueber ein EIGENES Fenster (eigener Start-/Endpunkt). Anders als das
+            # fruehere interval=None misst das NICHT "seit dem letzten psutil-
+            # Aufruf" — jener Referenzpunkt ist prozessweit geteilt, und andere
+            # psutil-Nutzer im selben HA-Prozess (v.a. die systemmonitor-
+            # Integration) setzen ihn staendig zurueck. Das liess unseren 60-s-
+            # Tick faktisch nur ein Mini-Intervall messen, das zufaellig in einen
+            # lastfreien Moment fallen konnte (Anzeige sprang auf ~1 %). Der
+            # 5-s-Mittelwert ist dagegen immun und kennt keinen 0.0-Erstwert.
+            # Blockiert nur diesen Executor-Thread, nicht den Event-Loop.
+            cpu = psutil.cpu_percent(interval=CPU_SAMPLE_INTERVAL_SECONDS)
             vm = psutil.virtual_memory()
             return {
                 "cpu_percent": round(float(cpu), 1),

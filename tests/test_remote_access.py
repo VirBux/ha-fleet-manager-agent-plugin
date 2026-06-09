@@ -66,7 +66,43 @@ class _FakeServices:
         self.calls.append({"domain": domain, "service": service, "data": data})
 
 
-def make_manager(session: FakeSession, response_status: int = 204) -> RemoteAccessManager:
+class _FakeCreds:
+    """Minimal-Credentials-Stub (#110)."""
+
+    def __init__(self, error: str | None = None):
+        self.error = error
+        self.active = error is None
+        self.username = "ha-fleet-integrator"
+        self.password = "" if error else "rotated-pw"
+
+
+class FakeIntegratorUser:
+    """Stub fuer IntegratorUserManager (#110): zaehlt activate/deactivate auf.
+
+    ``mode``: "ok" → erfolgreiche Aktivierung; "error" → Credentials mit error;
+    "none" → None (kein Credentials-Objekt).
+    """
+
+    def __init__(self, mode: str = "ok"):
+        self._mode = mode
+        self.activated = 0
+        self.deactivated = 0
+
+    async def async_activate(self):
+        self.activated += 1
+        if self._mode == "none":
+            return None
+        if self._mode == "error":
+            return _FakeCreds(error="user_missing")
+        return _FakeCreds()
+
+    async def async_deactivate(self):
+        self.deactivated += 1
+
+
+def make_manager(
+    session: FakeSession, response_status: int = 204, integrator_user: Any = None
+) -> RemoteAccessManager:
     hass = FakeHass()
     mgr = RemoteAccessManager(
         hass,
@@ -74,6 +110,7 @@ def make_manager(session: FakeSession, response_status: int = 204) -> RemoteAcce
         session=session,
         backend_url="https://api.ha-fleet-manager.com",
         api_key="test-api-key",
+        integrator_user=integrator_user,
     )
     return mgr
 
@@ -453,3 +490,89 @@ async def test_on_connection_request_gleiche_id_kein_flackern():
         c for c in ir._test_calls if c["action"] == "delete"  # type: ignore[attr-defined]
     ]
     assert delete_calls == []
+
+
+# --------------------------------------------------------- Tests: Wartungs-User-Kopplung (#110)
+
+
+@pytest.mark.asyncio
+async def test_accept_aktiviert_wartungs_user_vor_session():
+    """#110: Annahme aktiviert den Wartungs-User; danach laeuft die Session."""
+    session = FakeSession(204)
+    iu = FakeIntegratorUser("ok")
+    mgr = make_manager(session, integrator_user=iu)
+
+    await mgr.confirm_request("req-iu", accepted=True, duration_hours=2)
+
+    assert iu.activated == 1, "Wartungs-User muss aktiviert werden"
+    assert mgr.session is not None, "Session muss laufen"
+    accept_call = next(
+        (c for c in session.calls if "/connection-requests/req-iu/accept" in c["url"]),
+        None,
+    )
+    assert accept_call is not None
+
+
+@pytest.mark.asyncio
+async def test_accept_lehnt_ab_wenn_user_nicht_aktivierbar():
+    """#110 Fail-Closed: Aktivierung scheitert → reject statt accept, keine Session."""
+    session = FakeSession(204)
+    iu = FakeIntegratorUser("error")
+    mgr = make_manager(session, integrator_user=iu)
+
+    await mgr.confirm_request("req-fail", accepted=True, duration_hours=2)
+
+    assert iu.activated == 1
+    assert mgr.session is None, "ohne aktivierbaren User darf keine Session entstehen"
+    reject_call = next(
+        (c for c in session.calls if "/connection-requests/req-fail/reject" in c["url"]),
+        None,
+    )
+    accept_call = next(
+        (c for c in session.calls if "/connection-requests/req-fail/accept" in c["url"]),
+        None,
+    )
+    assert reject_call is not None, "muss reject posten"
+    assert accept_call is None, "darf NICHT accept posten"
+
+
+@pytest.mark.asyncio
+async def test_end_session_deaktiviert_wartungs_user():
+    """#110: Session-Ende deaktiviert den Wartungs-User."""
+    from ha_fleet_agent.remote_access import ActiveSession
+
+    session = FakeSession(204)
+    iu = FakeIntegratorUser("ok")
+    mgr = make_manager(session, integrator_user=iu)
+    mgr._session_obj = ActiveSession(
+        request_id="r", subject="s", reason="", duration_hours=2
+    )
+
+    result = await mgr.async_end_session(reason="manual")
+
+    assert result is True
+    assert iu.deactivated == 1, "Wartungs-User muss deaktiviert werden"
+    assert mgr.session is None
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_mit_preauth_aktiviert_user():
+    """#110 + §4.3: Auto-Accept per Vorab-Freigabe aktiviert den Wartungs-User ebenfalls."""
+    import datetime
+
+    from ha_fleet_agent.remote_access import PreAuthorization
+    from homeassistant.util import dt as dt_util  # noqa: PLC0415
+
+    session = FakeSession(204)
+    iu = FakeIntegratorUser("ok")
+    mgr = make_manager(session, integrator_user=iu)
+    mgr._pre_auth = PreAuthorization(
+        expires_at=dt_util.utcnow() + datetime.timedelta(hours=2), max_duration_hours=1
+    )
+
+    await mgr._on_connection_request(
+        {"request_id": "req-pre", "subject": "S", "reason": "R", "duration_hours": 3}
+    )
+
+    assert iu.activated == 1
+    assert mgr.session is not None

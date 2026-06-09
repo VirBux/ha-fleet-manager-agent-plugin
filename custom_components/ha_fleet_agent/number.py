@@ -4,7 +4,7 @@ Beide Werte tragen `EntityCategory.CONFIG`, sodass HA sie auf der Geräteseite
 in der Sektion „Konfiguration" gruppiert.
 
 - Gültigkeitsdauer der Vorab-Freigabe (1–168 h)
-- Maximale Sitzungsdauer einer einzelnen Verbindung (1–12 h)
+- Maximale Sitzungsdauer einer einzelnen Verbindung (1–720 h = 30 Tage)
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class PreAuthValidityNumber(_BaseNumber):
 
 
 class PreAuthMaxDurationNumber(_BaseNumber):
-    """Maximale Sitzungsdauer einer einzelnen Verbindung (1–12 h)."""
+    """Maximale Sitzungsdauer einer einzelnen Verbindung (1–720 h = 30 Tage)."""
 
     _attr_translation_key = "preauth_max_duration"
     _attr_icon = "mdi:timer-outline"

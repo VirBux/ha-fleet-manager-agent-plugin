@@ -36,6 +36,8 @@ class _FakeUser:
     def __init__(self, user_id: str) -> None:
         self.id = user_id
         self.is_active = True
+        # token_id -> Refresh-Token (fuer #110 async_deactivate-Tests)
+        self.refresh_tokens: dict[str, Any] = {}
 
 
 class _FakeAuthProviderData:
@@ -111,6 +113,9 @@ class _FakeAuthManager:
         self.created_users: list[dict[str, Any]] = []
         self.linked: list[tuple[str, str]] = []
         self._user_by_cred_id: dict[str, _FakeUser] = {}
+        self._users_by_id: dict[str, _FakeUser] = {}  # #110: async_get_user
+        self.updated: list[tuple[str, dict[str, Any]]] = []  # #110: async_update_user
+        self.removed_tokens: list[Any] = []  # #110: async_remove_refresh_token
         self._user_seq = 0
 
     # synchron, @callback in HA — hier reicht eine normale Methode
@@ -122,14 +127,29 @@ class _FakeAuthManager:
     async def async_create_user(self, **kwargs) -> Any:
         self._user_seq += 1
         self.created_users.append(kwargs)
-        return _FakeUser(f"new-user-{self._user_seq}")
+        user = _FakeUser(f"new-user-{self._user_seq}")
+        self._users_by_id[user.id] = user
+        return user
 
     async def async_link_user(self, user: Any, credentials: Any) -> None:
         self.linked.append((user.id, credentials.id))
         self._user_by_cred_id[credentials.id] = user
+        self._users_by_id[user.id] = user
 
     async def async_get_user(self, user_id: str) -> Any:
-        return None
+        return self._users_by_id.get(user_id)
+
+    async def async_update_user(self, user: Any, **kwargs: Any) -> None:
+        # HA-Signatur: async_update_user(user, name=None, is_active=None, ...)
+        if kwargs.get("is_active") is not None:
+            user.is_active = kwargs["is_active"]
+        self.updated.append((user.id, kwargs))
+
+    async def async_remove_refresh_token(self, token: Any) -> None:
+        self.removed_tokens.append(token)
+        for user in self._users_by_id.values():
+            for tid in [t for t, val in user.refresh_tokens.items() if val is token]:
+                del user.refresh_tokens[tid]
 
     async def async_get_user_by_credentials(self, credentials: Any) -> Any:
         return self._user_by_cred_id.get(credentials.id)
@@ -139,6 +159,7 @@ class _FakeAuthManager:
         self._user_seq += 1
         user = _FakeUser(f"existing-user-{self._user_seq}")
         self._user_by_cred_id[credentials.id] = user
+        self._users_by_id[user.id] = user
         return user
 
 
@@ -257,3 +278,81 @@ def test_create_user_nutzt_get_auth_provider_sync_fallback():
     manager = IntegratorUserManager(hass, entry_id="test-entry")
     _maybe_run(manager.async_setup())
     assert manager.credentials is not None
+
+
+# --------------------------------------------------------- #110 Fail-Closed + Rotation
+
+
+@pytest.mark.asyncio
+async def test_setup_laesst_user_deaktiviert_zurueck():
+    """Fail-Closed (#110): Nach dem Setup ruht der angelegte User deaktiviert."""
+    provider = _FakeAuthProvider()
+    hass = _FakeHass(provider)
+    manager = IntegratorUserManager(hass, entry_id="fc-entry")
+
+    await manager.async_setup()
+
+    assert manager.credentials is not None
+    user = await hass.auth.async_get_user(manager.credentials.user_id)
+    assert user is not None
+    assert user.is_active is False, "User muss nach Setup deaktiviert sein"
+    assert any(kw.get("is_active") is False for _id, kw in hass.auth.updated)
+
+
+@pytest.mark.asyncio
+async def test_activate_rotiert_passwort_und_aktiviert():
+    """async_activate: Passwort wird rotiert, User aktiviert, Credentials frisch."""
+    provider = _FakeAuthProvider()
+    hass = _FakeHass(provider)
+    manager = IntegratorUserManager(hass, entry_id="act-entry")
+    await manager.async_setup()
+    user_id = manager.credentials.user_id
+    pw_before = manager.credentials.password
+
+    creds = await manager.async_activate()
+
+    assert creds is not None and creds.error is None
+    assert creds.active is True
+    user = await hass.auth.async_get_user(user_id)
+    assert user.is_active is True, "User muss aktiviert sein"
+    assert provider.data.changed, "change_password (Rotation) muss gerufen werden"
+    assert creds.password == provider.data.changed[-1][1]
+    assert creds.password != pw_before, "Passwort muss sich geaendert haben"
+
+
+@pytest.mark.asyncio
+async def test_deactivate_entfernt_tokens_und_deaktiviert():
+    """async_deactivate: alle Refresh-Tokens des Users weg + is_active=False."""
+    provider = _FakeAuthProvider()
+    hass = _FakeHass(provider)
+    manager = IntegratorUserManager(hass, entry_id="deact-entry")
+    await manager.async_setup()
+    user_id = manager.credentials.user_id
+    await manager.async_activate()
+
+    user = await hass.auth.async_get_user(user_id)
+    user.refresh_tokens = {"t1": object(), "t2": object()}
+
+    await manager.async_deactivate()
+
+    assert user.is_active is False
+    assert user.refresh_tokens == {}, "alle Refresh-Tokens muessen entfernt sein"
+    assert len(hass.auth.removed_tokens) == 2
+
+
+@pytest.mark.asyncio
+async def test_activate_bei_geloeschtem_user_setzt_error():
+    """async_activate: User vom Endkunden geloescht → error-Flag, keine Aktivierung."""
+    provider = _FakeAuthProvider()
+    hass = _FakeHass(provider)
+    manager = IntegratorUserManager(hass, entry_id="gone-entry")
+    await manager.async_setup()
+    user_id = manager.credentials.user_id
+
+    hass.auth._users_by_id.pop(user_id, None)  # Endkunde loescht den User in HA
+
+    creds = await manager.async_activate()
+
+    assert creds is not None
+    assert creds.error == "user_missing"
+    assert creds.active is False

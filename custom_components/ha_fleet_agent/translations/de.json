@@ -39,7 +39,7 @@
           },
           "accept": {
             "title": "Anfrage annehmen",
-            "description": "Du kannst die Dauer der Wartungssession anpassen (max. 12 h).\n\n**Betreff:** {subject}\n**Vorgeschlagen:** {requested_hours} h",
+            "description": "Du kannst die Dauer der Wartungssession anpassen (max. 720 h = 30 Tage).\n\n**Betreff:** {subject}\n**Vorgeschlagen:** {requested_hours} h",
             "data": {
               "duration_hours": "Dauer in Stunden"
             }

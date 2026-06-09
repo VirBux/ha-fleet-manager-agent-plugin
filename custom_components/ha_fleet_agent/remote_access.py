@@ -19,7 +19,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant, callback
@@ -45,6 +45,9 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .integrator_user import IntegratorUserManager
 
 
 @dataclass
@@ -91,12 +94,17 @@ class RemoteAccessManager:
         session: aiohttp.ClientSession,
         backend_url: str,
         api_key: str,
+        integrator_user: IntegratorUserManager | None = None,
     ) -> None:
         self._hass = hass
         self._entry_id = entry_id
         self._session = session
         self._backend_url = backend_url.rstrip("/")
         self._api_key = api_key
+        # Wartungs-User-Manager (#110): Session-Start aktiviert ihn (+ Passwort-
+        # Rotation), Session-Ende deaktiviert ihn (+ Refresh-Token-Kill). Optional,
+        # damit Unit-Tests den Manager ohne HA-Auth-Stack instanziieren koennen.
+        self._integrator_user = integrator_user
 
         self._pre_auth: PreAuthorization | None = None
         self._session_obj: ActiveSession | None = None
@@ -373,7 +381,25 @@ class RemoteAccessManager:
         *,
         auto: bool,
     ) -> None:
-        """Anfrage annehmen: REST-Call + Session starten."""
+        """Anfrage annehmen: Wartungs-User scharf schalten, REST-Accept, Session starten.
+
+        Fail-Closed (#110): Der Wartungs-User wird VOR dem Accept aktiviert (und
+        sein Passwort rotiert). Schlaegt das fehl (z.B. User vom Endkunden
+        geloescht), wird die Anfrage abgelehnt statt eine Session ohne
+        funktionierenden Login zu eroeffnen.
+        """
+        if self._integrator_user is not None:
+            creds = await self._integrator_user.async_activate()
+            if creds is None or creds.error:
+                _LOGGER.error(
+                    "Wartungs-User nicht aktivierbar (%s) — Anfrage %s wird abgelehnt",
+                    creds.error if creds else "keine Credentials",
+                    request_id,
+                )
+                await self._post_response(request_id, accepted=False)
+                await self._dismiss_notification(request_id)
+                return
+
         await self._post_response(
             request_id, accepted=True, duration_hours=duration_hours
         )
@@ -429,7 +455,9 @@ class RemoteAccessManager:
         self, request_id: str, subject: str, reason: str, duration_hours: int
     ) -> None:
         """Eröffnet das Wartungsfenster — Auto-Disable nach `duration_hours`."""
-        await self._end_session(reason="restart", emit=False)
+        # User NICHT deaktivieren: _accept hat ihn gerade aktiviert; ein evtl.
+        # laufender Vorgaenger wird nur abgeloest (Handover/Neustart), nicht beendet.
+        await self._end_session(reason="restart", emit=False, deactivate_user=False)
 
         self._session_obj = ActiveSession(
             request_id=request_id,
@@ -454,7 +482,9 @@ class RemoteAccessManager:
     def _on_session_expired(self, _now: Any) -> None:
         self._hass.async_create_task(self._end_session(reason="timeout"))
 
-    async def _end_session(self, *, reason: str, emit: bool = True) -> None:
+    async def _end_session(
+        self, *, reason: str, emit: bool = True, deactivate_user: bool = True
+    ) -> None:
         if self._session_obj is None and self._session_expire_cancel is None:
             return
         if self._session_expire_cancel is not None:
@@ -467,6 +497,11 @@ class RemoteAccessManager:
                 reason,
             )
             self._session_obj = None
+        # Wartungs-User wieder fail-closed deaktivieren (#110, + Refresh-Token-Kill).
+        # Beim internen Neustart (reason="restart" aus _start_session) NICHT — dort
+        # wird unmittelbar eine neue Session mit frisch aktiviertem User eroeffnet.
+        if deactivate_user and self._integrator_user is not None:
+            await self._integrator_user.async_deactivate()
         if emit:
             self._publish_state()
 

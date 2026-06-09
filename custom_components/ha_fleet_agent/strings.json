@@ -39,7 +39,7 @@
           },
           "accept": {
             "title": "Accept request",
-            "description": "You can adjust the duration of the maintenance session (max. 12 h).\n\n**Subject:** {subject}\n**Proposed:** {requested_hours} h",
+            "description": "You can adjust the duration of the maintenance session (max. 720 h = 30 days).\n\n**Subject:** {subject}\n**Proposed:** {requested_hours} h",
             "data": {
               "duration_hours": "Duration in hours"
             }

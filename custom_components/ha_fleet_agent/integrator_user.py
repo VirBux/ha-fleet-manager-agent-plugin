@@ -9,8 +9,13 @@ Verantwortlichkeiten (REQUIREMENTS §4.4):
   ``homeassistant.helpers.storage.Store`` — denn beim Tunnel-Aufbau muessen
   wir es an den Integrator (ueber das Backend) durchreichen koennen. Der Store
   liegt im HA-Storage-Verzeichnis (`.storage/...`), Zugriff hat nur Root/HA.
-- Auf User-Deaktivierung durch den Endkunden reagieren: vor jedem Tunnel-Aufbau
-  pruefen ob der User noch aktiv ist; sonst ein Fehler-Flag im Frame setzen.
+- **Fail-Closed (#110):** Der User ruht standardmaessig **deaktiviert**
+  (`is_active=False`) und wird nur fuer die Dauer einer aktiven Wartungs-Session
+  scharf geschaltet — ``async_activate`` (Session-Start: Passwort rotieren +
+  aktivieren) / ``async_deactivate`` (Session-Ende: Refresh-Tokens entfernen +
+  deaktivieren). So ist der Admin-Account ausserhalb einer Freigabe wertlos,
+  selbst wenn die HA-Instanz von aussen (Nabu Casa, Port-Forward, …) erreichbar
+  ist. ``async_refresh_status`` bleibt als defensive Pruefung vor dem Tunnel.
 
 Die exakte HA-Auth-API hat in den letzten HA-Versionen mehrfach gewechselt;
 wir halten uns hier an die fuer 2024+/2026 dokumentierten Methoden:
@@ -84,30 +89,30 @@ class IntegratorUserManager:
         return self._credentials
 
     async def async_setup(self) -> None:
-        """Stellt sicher, dass der Wartungs-User existiert und Credentials persistiert sind."""
+        """Stellt sicher, dass der Wartungs-User existiert und **deaktiviert ruht**.
+
+        Fail-Closed (REQUIREMENTS §4.4 / #110): Der User wird beim Setup immer auf
+        ``is_active=False`` gesetzt. Eine Wartungs-Session schaltet ihn per
+        ``async_activate`` gezielt scharf und ``async_deactivate`` am Ende wieder
+        aus. So ist der Account ausserhalb einer aktiven Freigabe wertlos — auch
+        wenn die HA-Instanz von aussen erreichbar ist. Da Sessions nur in-memory
+        leben, ist beim Setup nie eine aktiv; "immer deaktivieren" ist korrekt und
+        deckt zugleich Crash-Recovery und die Migration von Bestandsinstallationen
+        (heute dauerhaft aktiv) ab.
+        """
         data = await self._store.async_load()
         if isinstance(data, dict) and data.get("user_id") and data.get("password"):
             user = await self._hass.auth.async_get_user(data["user_id"])
-            if user is not None and not user.is_active:
-                _LOGGER.warning(
-                    "Wartungs-User '%s' ist deaktiviert — Tunnel-Sessions sind eingeschraenkt",
-                    INTEGRATOR_USERNAME,
-                )
-                self._credentials = IntegratorCredentials(
-                    user_id=data["user_id"],
-                    username=INTEGRATOR_USERNAME,
-                    password="",
-                    active=False,
-                    error="user_disabled",
-                )
-                return
             if user is not None:
                 self._credentials = IntegratorCredentials(
                     user_id=user.id,
                     username=INTEGRATOR_USERNAME,
                     password=data["password"],
                 )
-                _LOGGER.debug("Wartungs-User aus Storage geladen: %s", user.id)
+                await self._ensure_deactivated(user)
+                _LOGGER.debug(
+                    "Wartungs-User aus Storage geladen, ruht deaktiviert: %s", user.id
+                )
                 return
             _LOGGER.info(
                 "Persistierter Wartungs-User nicht mehr vorhanden — wird neu angelegt"
@@ -147,6 +152,9 @@ class IntegratorUserManager:
             password=password,
         )
         await self._store.async_save({"user_id": user.id, "password": password})
+        # Fail-Closed (#110): der frisch angelegte User ruht deaktiviert, bis eine
+        # Wartungs-Session ihn ueber async_activate scharf schaltet.
+        await self._ensure_deactivated(user)
 
     def _auth_entry_exists(self, provider: Any) -> bool:
         """True, wenn der `homeassistant`-Provider den Integrator-Username kennt.
@@ -229,9 +237,11 @@ class IntegratorUserManager:
         if self._credentials is None:
             return
         if keep_user:
+            # Fail-Closed (#110): ein beibehaltener User MUSS deaktiviert ruhen —
+            # sonst bliebe nach dem Unload ein dauerhaft aktiver Admin-Account.
+            await self._ensure_deactivated()
             _LOGGER.info(
-                "Wartungs-User wird auf Wunsch des Endkunden beibehalten "
-                "(entry_id=%s)",
+                "Wartungs-User wird beibehalten und deaktiviert (entry_id=%s)",
                 self._entry_id,
             )
             return
@@ -279,3 +289,119 @@ class IntegratorUserManager:
                 active=False,
                 error="user_disabled",
             )
+
+    async def _ensure_deactivated(self, user: Any | None = None) -> None:
+        """Setzt den Wartungs-User auf ``is_active=False`` (fail-closed, idempotent).
+
+        ``user`` kann direkt uebergeben werden (spart einen Lookup); sonst wird er
+        ueber die persistierte ``user_id`` aufgeloest.
+        """
+        if user is None:
+            if self._credentials is None:
+                return
+            user = await self._hass.auth.async_get_user(self._credentials.user_id)
+        if user is None:
+            return
+        if getattr(user, "is_active", False):
+            await self._hass.auth.async_update_user(user, is_active=False)
+            _LOGGER.debug("Wartungs-User deaktiviert (fail-closed)")
+
+    async def async_activate(self) -> IntegratorCredentials | None:
+        """Session-Start: Passwort rotieren (Phase 2), User aktivieren, Credentials liefern.
+
+        Rueckgabe: die aktiven Credentials (mit frischem Passwort) oder — wenn der
+        User nicht mehr existiert — ein Credentials-Objekt mit ``error`` gesetzt
+        (der Aufrufer oeffnet dann keine Session).
+        """
+        if self._credentials is None:
+            _LOGGER.error(
+                "async_activate ohne Credentials — Wartungs-User nicht eingerichtet"
+            )
+            return None
+
+        user = await self._hass.auth.async_get_user(self._credentials.user_id)
+        if user is None:
+            _LOGGER.warning(
+                "Wartungs-User '%s' nicht mehr vorhanden — Aktivierung nicht moeglich",
+                INTEGRATOR_USERNAME,
+            )
+            self._credentials = IntegratorCredentials(
+                user_id=self._credentials.user_id,
+                username=INTEGRATOR_USERNAME,
+                password="",
+                active=False,
+                error="user_missing",
+            )
+            return self._credentials
+
+        # Phase 2 — Passwort pro Session rotieren: ein evtl. frueher geleaktes
+        # Passwort ist nach Session-Ende wertlos. Bei einem Provider-Problem
+        # bleibt das bisherige Passwort gueltig (Verfuegbarkeit > Rotation).
+        password = self._credentials.password
+        provider = self._hass.auth.get_auth_provider(_HA_AUTH_PROVIDER_TYPE, None)
+        if provider is not None:
+            new_password = secrets.token_urlsafe(24)
+            try:
+                await self._hass.async_add_executor_job(
+                    provider.data.change_password, INTEGRATOR_USERNAME, new_password
+                )
+                await provider.data.async_save()
+                password = new_password
+            except Exception:  # noqa: BLE001 — Rotation best-effort, Session laeuft weiter
+                _LOGGER.warning(
+                    "Passwort-Rotation fehlgeschlagen — nutze bisheriges Passwort",
+                    exc_info=True,
+                )
+
+        await self._hass.auth.async_update_user(user, is_active=True)
+        await self._store.async_save({"user_id": user.id, "password": password})
+        self._credentials = IntegratorCredentials(
+            user_id=user.id,
+            username=INTEGRATOR_USERNAME,
+            password=password,
+            active=True,
+        )
+        _LOGGER.info("Wartungs-User aktiviert + Passwort rotiert (Session-Start)")
+        return self._credentials
+
+    async def async_deactivate(self) -> None:
+        """Session-Ende: alle Refresh-Tokens des Users entfernen + ``is_active=False``.
+
+        Das Entfernen der Refresh-Tokens beendet eine noch offene Integrator-
+        Browser-Session **sofort** (statt erst nach Access-Token-Ablauf ~30 min).
+        """
+        if self._credentials is None:
+            return
+        user = await self._hass.auth.async_get_user(self._credentials.user_id)
+        if user is None:
+            self._credentials = IntegratorCredentials(
+                user_id=self._credentials.user_id,
+                username=INTEGRATOR_USERNAME,
+                password="",
+                active=False,
+                error="user_missing",
+            )
+            return
+
+        for token in list(getattr(user, "refresh_tokens", {}).values()):
+            try:
+                await self._hass.auth.async_remove_refresh_token(token)
+            except Exception:  # noqa: BLE001 — Best-effort Token-Cleanup
+                _LOGGER.debug(
+                    "Refresh-Token konnte nicht entfernt werden", exc_info=True
+                )
+
+        if getattr(user, "is_active", False):
+            await self._hass.auth.async_update_user(user, is_active=False)
+
+        # Passwort im Store bleibt liegen (wird beim naechsten Aktivieren rotiert);
+        # in den In-Memory-Credentials leeren wir es defensiv.
+        self._credentials = IntegratorCredentials(
+            user_id=user.id,
+            username=INTEGRATOR_USERNAME,
+            password="",
+            active=False,
+        )
+        _LOGGER.info(
+            "Wartungs-User deaktiviert + Refresh-Tokens entfernt (Session-Ende)"
+        )
