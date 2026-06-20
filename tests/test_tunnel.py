@@ -468,6 +468,60 @@ async def test_handover_close_delete_aber_kein_session_ende_kein_reconnect(make_
 
 
 @pytest.mark.asyncio
+async def test_delete_credentials_sendet_x_tunnel_token_header(make_forwarder):
+    """Direkter Aufruf: _delete_credentials(slug, token) sendet einen DELETE mit
+    X-Tunnel-Token == token (+ X-API-Key). Das Backend loest darueber den
+    TunnelToken auf und setzt den ConnectionRequest auf CLOSED — ohne den Header
+    antwortet revoke() mit 404, bevor der Request geschlossen wird (#108)."""
+    rest_calls: list[dict] = []
+
+    def rest_handler(call):
+        rest_calls.append(call)
+        return _FakeResponse(204, b"", {})
+
+    fwd, _, http_session, _ = make_forwarder(rest_handler=rest_handler)
+
+    await fwd._delete_credentials("deadbeef", "tt-abc")
+
+    delete_calls = [c for c in http_session.rest_calls if c["method"] == "DELETE"]
+    assert len(delete_calls) == 1
+    call = delete_calls[0]
+    assert "/api/agent/tunnels/deadbeef/credentials" in call["url"]
+    assert call["headers"]["X-Tunnel-Token"] == "tt-abc"
+    assert call["headers"]["X-API-Key"] == "test-api-key-1234567890"
+
+
+@pytest.mark.asyncio
+async def test_on_tunnel_closed_sichert_token_vor_reset_fuer_delete(make_forwarder):
+    """Round-Trip ueber _on_tunnel_closed (END-Intent): der DELETE traegt den VOR
+    dem None-Reset gesicherten X-Tunnel-Token. Beweist, dass _on_tunnel_closed das
+    Token sichert, bevor es self._active_tunnel_token auf None setzt — sonst liefe
+    der als Task ausgefuehrte _delete_credentials mit token=None (→ 404 im Backend)."""
+    rest_calls: list[dict] = []
+
+    def rest_handler(call):
+        rest_calls.append(call)
+        return _FakeResponse(204, b"", {})
+
+    fwd, _, http_session, hass = make_forwarder(rest_handler=rest_handler)
+    fwd._active_tunnel_slug = "deadbeef"
+    fwd._active_tunnel_token = "tt-xyz"
+    fwd._close_intent = CLOSE_INTENT_END
+
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    # Token wurde nach dem Close zurueckgesetzt ...
+    assert fwd._active_tunnel_token is None
+    # ... der DELETE traegt aber noch das gesicherte Token (Beweis fuer die Sicherung).
+    delete_calls = [c for c in http_session.rest_calls if c["method"] == "DELETE"]
+    assert len(delete_calls) == 1
+    call = delete_calls[0]
+    assert "/api/agent/tunnels/deadbeef/credentials" in call["url"]
+    assert call["headers"]["X-Tunnel-Token"] == "tt-xyz"
+
+
+@pytest.mark.asyncio
 async def test_close_intent_wird_nach_close_zurueckgesetzt(make_forwarder):
     """Nach einem END-Close steht der Intent wieder auf RECONNECT (nächster
     unerwarteter Abriss verhält sich korrekt)."""

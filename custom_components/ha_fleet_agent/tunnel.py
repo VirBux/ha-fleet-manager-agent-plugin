@@ -315,13 +315,19 @@ class TunnelForwarder:
         intent = self._close_intent
         self._close_intent = CLOSE_INTENT_RECONNECT  # für den nächsten Tunnel zurücksetzen
         slug = self._active_tunnel_slug
+        # Token VOR dem Reset sichern: _delete_credentials läuft als Task erst NACH dieser
+        # Methode — zu dem Zeitpunkt wäre self._active_tunnel_token bereits None. Ohne den
+        # X-Tunnel-Token-Header weist das Backend den DELETE mit 404 ab (resolveAndAuthorize),
+        # bevor es den ConnectionRequest auf CLOSED setzt → der Request bliebe ACCEPTED und
+        # der Agent-Poll würde ihn endlos per Reconnect-Token wiederbeleben.
+        token = self._active_tunnel_token
 
         # Credentials abräumen bei END und HANDOVER (alter Request wird im Backend
         # CLOSED). Bei RECONNECT NICHT — der DELETE würde den ConnectionRequest auf
         # CLOSED setzen und damit den Reconnect-Poll verhindern. (Beim graceful
         # Connector-Shutdown invalidiert der Connector den Cache ohnehin per Notify.)
         if intent in (CLOSE_INTENT_END, CLOSE_INTENT_HANDOVER) and slug:
-            self._hass.async_create_task(self._delete_credentials(slug))
+            self._hass.async_create_task(self._delete_credentials(slug, token))
 
         self._active_tunnel_slug = None
         self._active_tunnel_token = None
@@ -414,12 +420,20 @@ class TunnelForwarder:
                 "Credentials-POST für Slug '%s' Netzwerkfehler: %s", slug, err
             )
 
-    async def _delete_credentials(self, slug: str) -> None:
-        """DELETE /api/agent/tunnels/{slug}/credentials — Tunnel-Ende aufräumen."""
+    async def _delete_credentials(self, slug: str, token: str | None = None) -> None:
+        """DELETE /api/agent/tunnels/{slug}/credentials — Tunnel-Ende aufräumen.
+
+        Sendet den X-Tunnel-Token-Header mit (sofern bekannt): das Backend löst darüber
+        den TunnelToken auf und setzt den zugehörigen ConnectionRequest auf CLOSED. Ohne
+        den Header antwortet revoke() mit 404 (kein Token) BEVOR der Request geschlossen
+        wird — dann bliebe er ACCEPTED und käme via Reconnect-Poll endlos zurück.
+        """
         url = f"{self._backend_url}/api/agent/tunnels/{slug}/credentials"
         headers: dict[str, str] = {
             "X-API-Key": self._api_key,
         }
+        if token:
+            headers["X-Tunnel-Token"] = token
         timeout = aiohttp.ClientTimeout(total=10)
 
         try:
