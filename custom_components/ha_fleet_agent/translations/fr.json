@@ -1,0 +1,135 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configurer HA Fleet Manager Agent",
+        "description": "Saisissez la clé API, le domaine de base et la langue du tableau de bord généré automatiquement. Vous trouverez la clé API dans le tableau de bord Fleet Manager, sous Paramètres → Agents.",
+        "data": {
+          "api_key": "Clé API",
+          "base_domain": "Domaine de base",
+          "language": "Langue"
+        },
+        "data_description": {
+          "api_key": "Clé d'au moins 16 caractères issue du tableau de bord Fleet Manager.",
+          "base_domain": "Votre domaine HA Fleet Manager, p. ex. 'ha-fleet-manager.com'. Les URL du backend et du relais sont dérivées automatiquement.",
+          "language": "Langue du tableau de bord « Maintenance à distance » généré automatiquement. La valeur par défaut suit la langue de votre Home Assistant. Un tableau de bord en mode stockage ne peut pas être retraduit ensuite — pour en changer, supprimez puis réinstallez l'intégration."
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key": "La clé API doit comporter au moins 16 caractères.",
+      "invalid_base_domain": "Le domaine doit contenir au moins un point et ne doit pas comporter d'espaces (p. ex. ha-fleet-manager.com)."
+    },
+    "abort": {
+      "already_configured": "HA Fleet Manager Agent est déjà configuré."
+    }
+  },
+  "issues": {
+    "connection_request": {
+      "title": "Demande d'accès distant : {subject}",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Examiner la demande d'accès distant",
+            "description": "Votre société de maintenance souhaite établir un accès distant à votre Home Assistant.\n\n**Objet :** {subject}\n\n**Motif :** {reason}\n\n**Durée souhaitée :** {requested_hours} h\n\nQue voulez-vous faire ?",
+            "menu_options": {
+              "accept": "Accepter",
+              "reject": "Refuser"
+            }
+          },
+          "accept": {
+            "title": "Accepter la demande",
+            "description": "Vous pouvez ajuster la durée de la session de maintenance (max. 720 h = 30 jours).\n\n**Objet :** {subject}\n**Proposé :** {requested_hours} h",
+            "data": {
+              "duration_hours": "Durée en heures"
+            }
+          }
+        },
+        "abort": {
+          "already_resolved": "Cette demande a déjà reçu une réponse."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "connection_state": {
+        "name": "État de la connexion"
+      },
+      "remote_access_status": {
+        "name": "Statut de l'accès distant"
+      },
+      "preauth_expires_at": {
+        "name": "Expiration de la pré-autorisation"
+      },
+      "session_ends_at": {
+        "name": "Fin de la session active"
+      }
+    },
+    "binary_sensor": {
+      "tunnel_active": {
+        "name": "Tunnel actif"
+      }
+    },
+    "switch": {
+      "pre_authorization": {
+        "name": "Pré-autorisation"
+      }
+    },
+    "number": {
+      "preauth_validity": {
+        "name": "Durée de validité"
+      },
+      "preauth_max_duration": {
+        "name": "Durée max. de session"
+      }
+    },
+    "button": {
+      "close_tunnel": {
+        "name": "Fermer le tunnel"
+      }
+    }
+  },
+  "services": {
+    "grant_pre_authorization": {
+      "name": "Accorder une pré-autorisation",
+      "description": "Accorde une pré-autorisation de durée limitée à l'intégrateur (voir REQUIREMENTS §4.3). Pendant cette fenêtre, l'intégrateur peut ouvrir une connexion sans confirmation supplémentaire.",
+      "fields": {
+        "expires_in_hours": {
+          "name": "Valable pendant (heures)",
+          "description": "Période pendant laquelle la pré-autorisation reste active."
+        },
+        "max_duration_hours": {
+          "name": "Durée maximale de session (heures)",
+          "description": "Durée maximale d'une seule session d'accès distant."
+        }
+      }
+    },
+    "revoke_pre_authorization": {
+      "name": "Révoquer la pré-autorisation",
+      "description": "Révoque une pré-autorisation accordée précédemment."
+    },
+    "close_tunnel": {
+      "name": "Fermer le tunnel",
+      "description": "Ferme immédiatement un tunnel d'accès distant ouvert et met fin en même temps à la session de maintenance en cours (voir REQUIREMENTS §4.4). Un nouvel accès nécessite une nouvelle demande de connexion."
+    },
+    "confirm_request": {
+      "name": "Confirmer la demande de connexion",
+      "description": "Accepte ou refuse une demande de connexion en attente de l'intégrateur. Le request_id provient de la notification persistante.",
+      "fields": {
+        "request_id": {
+          "name": "ID de la demande",
+          "description": "ID de la demande de connexion."
+        },
+        "accepted": {
+          "name": "Accepter",
+          "description": "True = accepter, False = refuser."
+        },
+        "duration_hours": {
+          "name": "Durée réelle (heures)",
+          "description": "Facultatif — peut raccourcir la durée proposée par l'intégrateur."
+        }
+      }
+    }
+  }
+}

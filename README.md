@@ -25,9 +25,10 @@ port forwarding. Remote access is always **client-controlled**.
 - **Auto-generated remote-maintenance dashboard**: a dedicated Lovelace dashboard with
   status, control and action cards is created automatically on first setup (existing
   dashboards are never touched).
-- **Available in English and German**: you pick the language in the setup dialog (default
-  follows Home Assistant's configured language). The dashboard stays in the chosen language
-  even if Home Assistant later switches — remove and re-add the integration to change it.
+- **Available in five languages** (English, German, Spanish, French, Croatian): you pick the
+  language in the setup dialog (default follows Home Assistant's configured language). The
+  dashboard stays in the chosen language even if Home Assistant later switches — remove and
+  re-add the integration to change it.
 
 ## Requirements
 
@@ -62,8 +63,8 @@ After installation, add the integration via the UI:
      **Settings → Agents**.
    - **Base domain** — your HA Fleet Manager domain, e.g. `ha-fleet-manager.com`. The
      backend and relay URLs are derived automatically (`api.<domain>`, `relay.<domain>`).
-   - **Language** — Deutsch or English for the auto-generated dashboard. The dropdown
-     pre-selects whatever language Home Assistant itself is set to.
+   - **Language** — Deutsch, English, Español, Français or Hrvatski for the auto-generated
+     dashboard. The dropdown pre-selects whatever language Home Assistant itself is set to.
 
 That's it — the agent connects, starts reporting status, and creates the remote-maintenance
 dashboard.

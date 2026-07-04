@@ -1,0 +1,135 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Postavljanje HA Fleet Manager Agenta",
+        "description": "Unesite API ključ, osnovnu domenu i jezik za automatski generiranu nadzornu ploču. API ključ pronaći ćete u Fleet Manager nadzornoj ploči pod Postavke → Agenti.",
+        "data": {
+          "api_key": "API ključ",
+          "base_domain": "Osnovna domena",
+          "language": "Jezik"
+        },
+        "data_description": {
+          "api_key": "Ključ od najmanje 16 znakova iz Fleet Manager nadzorne ploče.",
+          "base_domain": "Vaša HA Fleet Manager domena, npr. 'ha-fleet-manager.com'. URL-ovi backenda i releja izvode se automatski.",
+          "language": "Jezik automatski generirane nadzorne ploče „Daljinsko održavanje“. Zadana vrijednost prati jezik vašeg Home Assistanta. Nadzorna ploča u načinu pohrane ne može se naknadno ponovno prevesti — za promjenu deinstalirajte i ponovno instalirajte integraciju."
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key": "API ključ mora imati najmanje 16 znakova.",
+      "invalid_base_domain": "Domena mora sadržavati barem jednu točku i ne smije imati razmake (npr. ha-fleet-manager.com)."
+    },
+    "abort": {
+      "already_configured": "HA Fleet Manager Agent već je postavljen."
+    }
+  },
+  "issues": {
+    "connection_request": {
+      "title": "Zahtjev za daljinski pristup: {subject}",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Pregled zahtjeva za daljinski pristup",
+            "description": "Vaša tvrtka za održavanje želi uspostaviti daljinski pristup vašem Home Assistantu.\n\n**Predmet:** {subject}\n\n**Razlog:** {reason}\n\n**Željeno trajanje:** {requested_hours} h\n\nŠto želite učiniti?",
+            "menu_options": {
+              "accept": "Prihvati",
+              "reject": "Odbij"
+            }
+          },
+          "accept": {
+            "title": "Prihvati zahtjev",
+            "description": "Možete prilagoditi trajanje sesije održavanja (maks. 720 h = 30 dana).\n\n**Predmet:** {subject}\n**Predloženo:** {requested_hours} h",
+            "data": {
+              "duration_hours": "Trajanje u satima"
+            }
+          }
+        },
+        "abort": {
+          "already_resolved": "Na ovaj zahtjev već je odgovoreno."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "connection_state": {
+        "name": "Stanje veze"
+      },
+      "remote_access_status": {
+        "name": "Stanje daljinskog pristupa"
+      },
+      "preauth_expires_at": {
+        "name": "Predodobrenje istječe"
+      },
+      "session_ends_at": {
+        "name": "Aktivna sesija završava"
+      }
+    },
+    "binary_sensor": {
+      "tunnel_active": {
+        "name": "Tunel aktivan"
+      }
+    },
+    "switch": {
+      "pre_authorization": {
+        "name": "Predodobrenje"
+      }
+    },
+    "number": {
+      "preauth_validity": {
+        "name": "Trajanje valjanosti"
+      },
+      "preauth_max_duration": {
+        "name": "Maks. trajanje sesije"
+      }
+    },
+    "button": {
+      "close_tunnel": {
+        "name": "Prekini tunel"
+      }
+    }
+  },
+  "services": {
+    "grant_pre_authorization": {
+      "name": "Dodijeli predodobrenje",
+      "description": "Dodjeljuje vremenski ograničeno predodobrenje integratoru (vidi REQUIREMENTS §4.3). Unutar tog okvira integrator može uspostaviti vezu bez dodatne potvrde.",
+      "fields": {
+        "expires_in_hours": {
+          "name": "Vrijedi (sati)",
+          "description": "Razdoblje tijekom kojeg predodobrenje ostaje aktivno."
+        },
+        "max_duration_hours": {
+          "name": "Maksimalno trajanje sesije (sati)",
+          "description": "Maksimalno trajanje jedne sesije daljinskog pristupa."
+        }
+      }
+    },
+    "revoke_pre_authorization": {
+      "name": "Opozovi predodobrenje",
+      "description": "Opoziva prethodno dodijeljeno predodobrenje."
+    },
+    "close_tunnel": {
+      "name": "Prekini tunel",
+      "description": "Odmah zatvara otvoreni tunel daljinskog pristupa i istovremeno završava sesiju održavanja u tijeku (vidi REQUIREMENTS §4.4). Za ponovni pristup potreban je novi zahtjev za vezu."
+    },
+    "confirm_request": {
+      "name": "Potvrdi zahtjev za vezu",
+      "description": "Prihvaća ili odbija zahtjev za vezu integratora koji čeka. request_id dolazi iz trajne obavijesti.",
+      "fields": {
+        "request_id": {
+          "name": "ID zahtjeva",
+          "description": "ID zahtjeva za vezu."
+        },
+        "accepted": {
+          "name": "Prihvati",
+          "description": "True = prihvati, False = odbij."
+        },
+        "duration_hours": {
+          "name": "Stvarno trajanje (sati)",
+          "description": "Neobavezno — može skratiti trajanje koje je predložio integrator."
+        }
+      }
+    }
+  }
+}

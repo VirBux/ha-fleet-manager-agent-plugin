@@ -1,0 +1,135 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configurar HA Fleet Manager Agent",
+        "description": "Introduce la clave API, el dominio base y el idioma del panel generado automáticamente. Encontrarás la clave API en el panel de Fleet Manager, en Ajustes → Agentes.",
+        "data": {
+          "api_key": "Clave API",
+          "base_domain": "Dominio base",
+          "language": "Idioma"
+        },
+        "data_description": {
+          "api_key": "Clave de al menos 16 caracteres del panel de Fleet Manager.",
+          "base_domain": "Tu dominio de HA Fleet Manager, p. ej. 'ha-fleet-manager.com'. Las URL del backend y del relay se derivan automáticamente.",
+          "language": "Idioma del panel «Mantenimiento remoto» generado automáticamente. El valor predeterminado sigue el idioma de tu Home Assistant. Un panel en modo de almacenamiento no se puede volver a traducir después — para cambiarlo, desinstala y vuelve a instalar la integración."
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key": "La clave API debe tener al menos 16 caracteres.",
+      "invalid_base_domain": "El dominio debe contener al menos un punto y no puede tener espacios (p. ej. ha-fleet-manager.com)."
+    },
+    "abort": {
+      "already_configured": "HA Fleet Manager Agent ya está configurado."
+    }
+  },
+  "issues": {
+    "connection_request": {
+      "title": "Solicitud de acceso remoto: {subject}",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Revisar la solicitud de acceso remoto",
+            "description": "Tu empresa de mantenimiento quiere establecer un acceso remoto a tu Home Assistant.\n\n**Asunto:** {subject}\n\n**Motivo:** {reason}\n\n**Duración solicitada:** {requested_hours} h\n\n¿Qué quieres hacer?",
+            "menu_options": {
+              "accept": "Aceptar",
+              "reject": "Rechazar"
+            }
+          },
+          "accept": {
+            "title": "Aceptar la solicitud",
+            "description": "Puedes ajustar la duración de la sesión de mantenimiento (máx. 720 h = 30 días).\n\n**Asunto:** {subject}\n**Propuesto:** {requested_hours} h",
+            "data": {
+              "duration_hours": "Duración en horas"
+            }
+          }
+        },
+        "abort": {
+          "already_resolved": "Esta solicitud ya ha sido respondida."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "connection_state": {
+        "name": "Estado de conexión"
+      },
+      "remote_access_status": {
+        "name": "Estado del acceso remoto"
+      },
+      "preauth_expires_at": {
+        "name": "La autorización previa caduca"
+      },
+      "session_ends_at": {
+        "name": "La sesión activa termina"
+      }
+    },
+    "binary_sensor": {
+      "tunnel_active": {
+        "name": "Túnel activo"
+      }
+    },
+    "switch": {
+      "pre_authorization": {
+        "name": "Autorización previa"
+      }
+    },
+    "number": {
+      "preauth_validity": {
+        "name": "Duración de validez"
+      },
+      "preauth_max_duration": {
+        "name": "Duración máx. de sesión"
+      }
+    },
+    "button": {
+      "close_tunnel": {
+        "name": "Cerrar túnel"
+      }
+    }
+  },
+  "services": {
+    "grant_pre_authorization": {
+      "name": "Conceder autorización previa",
+      "description": "Concede una autorización previa de duración limitada al integrador (véase REQUIREMENTS §4.3). Dentro de ese intervalo, el integrador puede abrir una conexión sin más confirmación.",
+      "fields": {
+        "expires_in_hours": {
+          "name": "Válida durante (horas)",
+          "description": "Intervalo de tiempo durante el cual la autorización previa permanece activa."
+        },
+        "max_duration_hours": {
+          "name": "Duración máxima de sesión (horas)",
+          "description": "Duración máxima de una sola sesión de acceso remoto."
+        }
+      }
+    },
+    "revoke_pre_authorization": {
+      "name": "Revocar autorización previa",
+      "description": "Revoca una autorización previa concedida anteriormente."
+    },
+    "close_tunnel": {
+      "name": "Cerrar túnel",
+      "description": "Cierra de inmediato un túnel de acceso remoto abierto y finaliza al mismo tiempo la sesión de mantenimiento en curso (véase REQUIREMENTS §4.4). Para volver a acceder se requiere una nueva solicitud de conexión."
+    },
+    "confirm_request": {
+      "name": "Confirmar solicitud de conexión",
+      "description": "Acepta o rechaza una solicitud de conexión pendiente del integrador. El request_id proviene de la notificación persistente.",
+      "fields": {
+        "request_id": {
+          "name": "ID de solicitud",
+          "description": "ID de la solicitud de conexión."
+        },
+        "accepted": {
+          "name": "Aceptar",
+          "description": "True = aceptar, False = rechazar."
+        },
+        "duration_hours": {
+          "name": "Duración real (horas)",
+          "description": "Opcional — puede acortar la duración propuesta por el integrador."
+        }
+      }
+    }
+  }
+}

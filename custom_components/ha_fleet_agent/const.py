@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -14,18 +14,27 @@ CONF_BACKEND_URL = "backend_url"
 # (z.B. "wss://relay.ha-fleet-manager.com"). Nur beim Tunnel-Aufbau genutzt.
 CONF_RELAY_URL = "relay_url"
 # CONF_LANGUAGE — vom Endkunden im Config-Flow gewaehlte Sprache fuer das
-# Auto-Dashboard. ``"de"`` oder ``"en"``. Bei Bestandsinstallationen aus 0.7.0
-# (Feld fehlt im ConfigEntry) faellt der Code defensiv auf hass.config.language
-# zurueck, damit das Update nicht crasht.
+# Auto-Dashboard. Eine der ``SUPPORTED_LANGUAGES``. Bei Bestandsinstallationen
+# aus 0.7.0 (Feld fehlt im ConfigEntry) faellt der Code defensiv auf
+# hass.config.language zurueck, damit das Update nicht crasht.
 CONF_LANGUAGE = "language"
 
 # Unterstuetzte Plugin-Sprachen + Default. Single Source of Truth — dashboard.py
-# und config_flow.py importieren von hier.
-SUPPORTED_LANGUAGES = ("de", "en")
+# und config_flow.py importieren von hier. Reihenfolge = Anzeige-Reihenfolge im
+# Sprach-Dropdown; deckungsgleich mit den Sprachen der Fleet-Manager-Web-App
+# (de/en/es/fr/hr). Pro Sprache existiert ein vollstaendiger ``_DASHBOARD_TEXTS``-
+# Block (dashboard.py) UND eine HA-Integrations-Translation (translations/<lang>.json).
+SUPPORTED_LANGUAGES = ("de", "en", "es", "fr", "hr")
 DEFAULT_LANGUAGE = "en"
 # Labels fuer den Sprach-Dropdown im Config-Flow. Bewusst nicht uebersetzt —
 # Sprachen werden in der jeweiligen Eigensprache bezeichnet (i18n-Best-Practice).
-LANGUAGE_LABELS = {"de": "Deutsch", "en": "English"}
+LANGUAGE_LABELS = {
+    "de": "Deutsch",
+    "en": "English",
+    "es": "Español",
+    "fr": "Français",
+    "hr": "Hrvatski",
+}
 
 # Intervalle
 STATE_UPDATE_INTERVAL_SECONDS = 60

@@ -14,9 +14,10 @@ Hostnamen) wird ebenfalls der direkte Modus aktiviert und relay_url gleich
 backend_url mit ws(s)://-Schema gesetzt — "relay.localhost" wäre meist kein
 gültiger DNS-Name. Diese Logik ist explizit als MVP-Heuristik dokumentiert.
 
-Sprache (TODO #100): Endkunde waehlt explizit zwischen Deutsch und Englisch.
-Default ist die HA-Systemsprache (``hass.config.language``), gemappt auf
-``"de"`` oder ``"en"``. Wir lesen NICHT mehr aus ``hass.config.language``
+Sprache (TODO #100; FR/HR/ES ergaenzt 1.5.0): Endkunde waehlt explizit eine der
+``SUPPORTED_LANGUAGES`` (de/en/es/fr/hr). Default ist die HA-Systemsprache
+(``hass.config.language``), gemappt auf eine unterstuetzte Sprache (sonst
+``DEFAULT_LANGUAGE``). Wir lesen NICHT mehr aus ``hass.config.language``
 zur Dashboard-Render-Zeit — das war zu fehleranfaellig (HA-Profile-Sprache
 pro User vs. System-Sprache; Default-Voreinstellung in HAOS-Setup-Wizards
 oft falsch). Die explizite Wahl beim Setup ist die kanonische Quelle.
@@ -117,11 +118,13 @@ def validate_base_domain(value: str) -> str | None:
 
 
 def _default_language_from_hass(hass: HomeAssistant | None) -> str:
-    """Default-Sprache aus ``hass.config.language`` — Praefix-Match auf DE/EN.
+    """Default-Sprache aus ``hass.config.language`` — Praefix-Match auf eine
+    der ``SUPPORTED_LANGUAGES``.
 
     Beispiel: ``"de_DE"`` -> ``"de"``, ``"en_US"`` -> ``"en"``, ``"fr"`` ->
-    ``DEFAULT_LANGUAGE``. Greift defensiv, wenn ``hass`` oder ``hass.config``
-    fehlt (Test-Setup).
+    ``"fr"``, ``"es_ES"`` -> ``"es"``, ``"hr"`` -> ``"hr"``; eine nicht
+    unterstuetzte Sprache (z.B. ``"it"``) -> ``DEFAULT_LANGUAGE``. Greift
+    defensiv, wenn ``hass`` oder ``hass.config`` fehlt (Test-Setup).
     """
     raw = ""
     if hass is not None:

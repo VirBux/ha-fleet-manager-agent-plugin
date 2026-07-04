@@ -4,9 +4,10 @@ REQUIREMENTS Sec. 4.6 / TODO #91 — beim Einrichten des Plugins entsteht in der
 HA-Instanz des Endkunden automatisch ein eigenes Lovelace-Dashboard
 (url_path 'ha-fleet-manager', Storage-Mode) als Surface fuer die 9 Plugin-Entities.
 
-**Sprache (TODO #100, Plugin 0.7.0/0.7.1):** Texte (Sidebar-Titel, Intro-Markdown,
-Sektions-Headings, Tile-Namen) sind ueber ``_DASHBOARD_TEXTS`` zwei-sprachig
-hinterlegt (DE/EN). Seit 0.7.1 waehlt der Endkunde die Sprache **explizit im
+**Sprache (TODO #100, Plugin 0.7.0/0.7.1; FR/HR/ES ergaenzt 1.5.0):** Texte
+(Sidebar-Titel, Intro-Markdown, Sektions-Headings, Tile-Namen) sind ueber
+``_DASHBOARD_TEXTS`` mehrsprachig hinterlegt (de/en/es/fr/hr — deckungsgleich mit
+den Sprachen der Fleet-Manager-Web-App). Seit 0.7.1 waehlt der Endkunde die Sprache **explizit im
 Config-Flow** — der Wert landet in ``entry.data[CONF_LANGUAGE]`` und wird
 ueber ``_lang_from_entry`` ausgelesen. Frueher (0.7.0) wurde stattdessen
 ``hass.config.language`` herangezogen, was Probleme machte (HA-Profile-Sprache
@@ -261,6 +262,230 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "close_tunnel": "Close tunnel",
         },
     },
+    "es": {
+        "dashboard_title": "Mantenimiento remoto",
+        "sidebar_title": "Mantenimiento remoto",
+        "header_subtitle": "**Mantenimiento remoto por tu equipo de smart home.**",
+        "intro_markdown": (
+            "### ¿Qué es este panel?\n\n"
+            "Este panel lo ha creado automáticamente el plugin **HA Fleet Manager "
+            "Agent**. Es el software con el que tu equipo de smart home puede dar "
+            "mantenimiento de forma remota y segura a tu instalación de Home "
+            "Assistant, sin que tengas que configurar una VPN ni redirección de "
+            "puertos.\n\n"
+            "### ¿Para qué lo necesito?\n\n"
+            "Cuando tu equipo necesita comprobar o ajustar algo, establece un túnel "
+            "cifrado hacia tu HA, **siempre con tu consentimiento**. Aquí tienes en "
+            "todo momento la visión general y el control:\n\n"
+            "- ves si hay alguien conectado en este momento,\n"
+            "- concedes, si quieres, una **autorización previa** para citas "
+            "programadas,\n"
+            "- finalizas una sesión en curso con un solo clic.\n\n"
+            "### ¿Qué tengo que hacer?\n\n"
+            "En el día a día, **nada**. Cuando tu equipo quiere conectarse, en Home "
+            "Assistant aparece en *Ajustes → Reparaciones* una solicitud con el "
+            "asunto, el motivo y la duración deseada; tú eliges **Aceptar** o "
+            "**Rechazar**.\n\n"
+            "Este panel sirve solo para la visión general y para las autorizaciones "
+            "previas **proactivas** (por ejemplo, cuando hay una cita de "
+            "mantenimiento acordada y no quieres confirmar manualmente cada vez)."
+        ),
+        "status_section_title": "Estado",
+        "status_help": (
+            "De un vistazo: ¿qué está pasando ahora mismo?\n\n"
+            "- **Estado del acceso remoto** — estado general: *idle* (no hay nada en "
+            "marcha), *pre_authorized* (autorización previa activa) o "
+            "*session_active* (mantenimiento en curso).\n"
+            "- **Túnel activo** — *Sí* en cuanto tu equipo está conectado.\n"
+            "- **Estado de conexión** — conexión del plugin con el servidor de Fleet "
+            "Manager. Normalmente debería estar *connected*.\n"
+            "- **La autorización previa caduca** / **La sesión activa termina** — "
+            "momentos en los que una autorización o una sesión en curso finaliza "
+            "automáticamente."
+        ),
+        "control_section_title": "Autorización previa (control)",
+        "control_help": (
+            "**¿Qué es una autorización previa?** Permites que tu equipo se conecte "
+            "sin más confirmación, dentro de un intervalo de tiempo que tú mismo "
+            "defines. Práctico, por ejemplo, para una cita de mantenimiento "
+            "acordada.\n\n"
+            "1. Activa la **Autorización previa**,\n"
+            "2. Elige la **Duración de validez** (cuánto tiempo puede usarse la "
+            "autorización antes de caducar — p. ej. 8 h),\n"
+            "3. Elige la **Duración máx. de sesión** (cuánto puede durar como máximo "
+            "una sola sesión de mantenimiento — p. ej. 4 h).\n\n"
+            "Vuelve a desactivar la autorización previa en cuanto ya no la "
+            "necesites; así mantienes el control total."
+        ),
+        "action_section_title": "Acciones",
+        "action_help": (
+            "¿Quieres finalizar de inmediato una sesión de mantenimiento en curso? "
+            "Haz clic en **Cerrar túnel** — la conexión de tu equipo se cierra al "
+            "instante.\n\n"
+            "Una **autorización previa** existente no se ve afectada: tu equipo "
+            "podría, en teoría, volver a conectarse enseguida. Si no quieres eso, "
+            "desactiva primero la autorización previa de arriba."
+        ),
+        "tiles": {
+            "remote_access_status": "Estado del acceso remoto",
+            "connection_state": "Estado de conexión",
+            "tunnel_active": "Túnel activo",
+            "preauth_expires_at": "La autorización previa caduca",
+            "session_ends_at": "La sesión activa termina",
+            "pre_authorization": "Autorización previa",
+            "preauth_validity": "Duración de validez",
+            "preauth_max_duration": "Duración máx. de sesión",
+            "close_tunnel": "Cerrar túnel",
+        },
+    },
+    "fr": {
+        "dashboard_title": "Maintenance à distance",
+        "sidebar_title": "Maintenance à distance",
+        "header_subtitle": "**Maintenance à distance par votre équipe domotique.**",
+        "intro_markdown": (
+            "### Qu'est-ce que ce tableau de bord ?\n\n"
+            "Ce tableau de bord a été créé automatiquement par le plugin **HA Fleet "
+            "Manager Agent**. C'est le logiciel grâce auquel votre équipe domotique "
+            "peut entretenir votre installation Home Assistant à distance et en "
+            "toute sécurité, sans que vous ayez à configurer un VPN ou une "
+            "redirection de ports.\n\n"
+            "### À quoi me sert-il ?\n\n"
+            "Lorsque votre équipe doit vérifier ou régler quelque chose, elle "
+            "établit un tunnel chiffré vers votre HA, **toujours avec votre "
+            "accord**. Ici, vous gardez à tout moment la vue d'ensemble et le "
+            "contrôle :\n\n"
+            "- vous voyez si quelqu'un est connecté en ce moment,\n"
+            "- vous accordez si vous le souhaitez une **pré-autorisation** pour les "
+            "rendez-vous planifiés,\n"
+            "- vous mettez fin à une session en cours d'un simple clic.\n\n"
+            "### Que dois-je faire ?\n\n"
+            "Au quotidien, **rien**. Lorsque votre équipe souhaite se connecter, une "
+            "demande apparaît dans Home Assistant sous *Paramètres → Réparations*, "
+            "avec l'objet, le motif et la durée souhaitée ; vous choisissez "
+            "**Accepter** ou **Refuser**.\n\n"
+            "Ce tableau de bord sert uniquement à la vue d'ensemble et aux "
+            "pré-autorisations **proactives** (par exemple lorsqu'un rendez-vous de "
+            "maintenance est convenu et que vous ne voulez pas confirmer "
+            "manuellement à chaque fois)."
+        ),
+        "status_section_title": "Statut",
+        "status_help": (
+            "En un coup d'œil : que se passe-t-il en ce moment ?\n\n"
+            "- **Statut de l'accès distant** — état global : *idle* (rien en cours), "
+            "*pre_authorized* (pré-autorisation active) ou *session_active* "
+            "(maintenance en cours).\n"
+            "- **Tunnel actif** — *Oui* dès que votre équipe est connectée.\n"
+            "- **État de la connexion** — connexion du plugin au serveur Fleet "
+            "Manager. Devrait normalement être *connected*.\n"
+            "- **Expiration de la pré-autorisation** / **Fin de la session active** "
+            "— moments auxquels une pré-autorisation ou une session en cours se "
+            "termine automatiquement."
+        ),
+        "control_section_title": "Pré-autorisation (commandes)",
+        "control_help": (
+            "**Qu'est-ce qu'une pré-autorisation ?** Vous autorisez votre équipe à "
+            "se connecter sans confirmation supplémentaire, dans une fenêtre de "
+            "temps que vous définissez vous-même. Pratique par exemple pour un "
+            "rendez-vous de maintenance convenu.\n\n"
+            "1. Activez la **Pré-autorisation**,\n"
+            "2. Choisissez la **Durée de validité** (combien de temps la "
+            "pré-autorisation peut être utilisée avant d'expirer — p. ex. 8 h),\n"
+            "3. Choisissez la **Durée max. de session** (combien de temps une seule "
+            "session de maintenance peut durer au maximum — p. ex. 4 h).\n\n"
+            "Désactivez à nouveau la pré-autorisation dès que vous n'en avez plus "
+            "besoin ; vous gardez ainsi le contrôle total."
+        ),
+        "action_section_title": "Actions",
+        "action_help": (
+            "Vous voulez mettre fin immédiatement à une session de maintenance en "
+            "cours ? Cliquez sur **Fermer le tunnel** — la connexion de votre équipe "
+            "est fermée instantanément.\n\n"
+            "Une **pré-autorisation** existante n'est pas affectée : votre équipe "
+            "pourrait en théorie se reconnecter aussitôt. Si vous ne le souhaitez "
+            "pas, désactivez d'abord la pré-autorisation ci-dessus."
+        ),
+        "tiles": {
+            "remote_access_status": "Statut de l'accès distant",
+            "connection_state": "État de la connexion",
+            "tunnel_active": "Tunnel actif",
+            "preauth_expires_at": "Expiration de la pré-autorisation",
+            "session_ends_at": "Fin de la session active",
+            "pre_authorization": "Pré-autorisation",
+            "preauth_validity": "Durée de validité",
+            "preauth_max_duration": "Durée max. de session",
+            "close_tunnel": "Fermer le tunnel",
+        },
+    },
+    "hr": {
+        "dashboard_title": "Daljinsko održavanje",
+        "sidebar_title": "Daljinsko održavanje",
+        "header_subtitle": "**Daljinsko održavanje od strane vašeg tima za pametni dom.**",
+        "intro_markdown": (
+            "### Što je ova nadzorna ploča?\n\n"
+            "Ovu nadzornu ploču automatski je izradio dodatak **HA Fleet Manager "
+            "Agent**. To je softver pomoću kojeg vaš tim za pametni dom može sigurno "
+            "daljinski održavati vašu Home Assistant instalaciju, a da ne morate "
+            "postavljati VPN ni prosljeđivanje portova.\n\n"
+            "### Čemu mi služi?\n\n"
+            "Kada vaš tim treba nešto provjeriti ili podesiti, uspostavlja šifrirani "
+            "tunel prema vašem HA-u, **uvijek uz vašu suglasnost**. Ovdje u svakom "
+            "trenutku imate pregled i kontrolu:\n\n"
+            "- vidite je li trenutačno netko povezan,\n"
+            "- po želji dajete **predodobrenje** za zakazane termine,\n"
+            "- jednim klikom prekidate sesiju koja je u tijeku.\n\n"
+            "### Što ja trebam učiniti?\n\n"
+            "U svakodnevnom radu **ništa**. Kada se vaš tim želi povezati, u Home "
+            "Assistantu se pod *Postavke → Popravci* pojavljuje zahtjev s predmetom, "
+            "razlogom i željenim trajanjem; vi birate **Prihvati** ili **Odbij**.\n\n"
+            "Ova nadzorna ploča služi samo za pregled i za **proaktivna** "
+            "predodobrenja (na primjer kada je dogovoren termin održavanja, a ne "
+            "želite svaki put ručno potvrđivati)."
+        ),
+        "status_section_title": "Stanje",
+        "status_help": (
+            "Na prvi pogled: što se trenutačno događa?\n\n"
+            "- **Stanje daljinskog pristupa** — ukupno stanje: *idle* (ništa nije u "
+            "tijeku), *pre_authorized* (predodobrenje aktivno) ili *session_active* "
+            "(održavanje u tijeku).\n"
+            "- **Tunel aktivan** — *Da* čim je vaš tim povezan.\n"
+            "- **Stanje veze** — veza dodatka s Fleet Manager poslužiteljem. "
+            "Uobičajeno bi trebala biti *connected*.\n"
+            "- **Predodobrenje istječe** / **Aktivna sesija završava** — trenuci u "
+            "kojima predodobrenje ili sesija u tijeku automatski završava."
+        ),
+        "control_section_title": "Predodobrenje (upravljanje)",
+        "control_help": (
+            "**Što je predodobrenje?** Dopuštate svojem timu da se poveže bez "
+            "dodatne potvrde, unutar vremenskog okvira koji sami određujete. "
+            "Praktično, primjerice, za dogovoreni termin održavanja.\n\n"
+            "1. Uključite **Predodobrenje**,\n"
+            "2. Odaberite **Trajanje valjanosti** (koliko se dugo predodobrenje "
+            "smije koristiti prije nego što istekne — npr. 8 h),\n"
+            "3. Odaberite **Maks. trajanje sesije** (koliko najdulje smije trajati "
+            "jedna sesija održavanja — npr. 4 h).\n\n"
+            "Isključite predodobrenje čim vam više ne treba — tako zadržavate punu "
+            "kontrolu."
+        ),
+        "action_section_title": "Radnje",
+        "action_help": (
+            "Želite li odmah prekinuti sesiju održavanja koja je u tijeku? Kliknite "
+            "na **Prekini tunel** — veza vašeg tima zatvara se trenutačno.\n\n"
+            "Postojeće **predodobrenje** time ostaje netaknuto: vaš bi se tim "
+            "teoretski mogao odmah ponovno povezati. Ako to ne želite, prvo gore "
+            "isključite predodobrenje."
+        ),
+        "tiles": {
+            "remote_access_status": "Stanje daljinskog pristupa",
+            "connection_state": "Stanje veze",
+            "tunnel_active": "Tunel aktivan",
+            "preauth_expires_at": "Predodobrenje istječe",
+            "session_ends_at": "Aktivna sesija završava",
+            "pre_authorization": "Predodobrenje",
+            "preauth_validity": "Trajanje valjanosti",
+            "preauth_max_duration": "Maks. trajanje sesije",
+            "close_tunnel": "Prekini tunel",
+        },
+    },
 }
 
 
@@ -273,8 +498,9 @@ def _resolve_language(hass: HomeAssistant) -> str:
     """Liest die HA-Sprache und mappt sie auf eine unterstuetzte Plugin-Sprache.
 
     ``hass.config.language`` kann ``"de"``, ``"de_DE"``, ``"en"``, ``"en_GB"``,
-    ``"fr"`` usw. sein — wir schneiden auf den 2-Buchstaben-Praefix und mappen
-    alles ausser ``"de"`` auf den ``DEFAULT_LANGUAGE`` (``"en"``).
+    ``"es"``, ``"fr_FR"``, ``"hr"`` usw. sein — wir schneiden auf den
+    2-Buchstaben-Praefix und behalten ihn, wenn er zu ``SUPPORTED_LANGUAGES``
+    gehoert; alles andere faellt auf ``DEFAULT_LANGUAGE`` (``"en"``).
 
     Wird seit Plugin 0.7.1 nur noch als **Fallback** verwendet: kanonische
     Quelle ist die im Config-Flow gewaehlte Sprache (``entry.data[CONF_LANGUAGE]``,

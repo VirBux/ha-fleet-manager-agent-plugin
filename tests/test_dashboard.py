@@ -33,7 +33,12 @@ import asyncio
 import pytest
 
 from ha_fleet_agent import dashboard
-from ha_fleet_agent.const import CONF_LANGUAGE, DOMAIN
+from ha_fleet_agent.const import (
+    CONF_LANGUAGE,
+    DEFAULT_LANGUAGE,
+    DOMAIN,
+    SUPPORTED_LANGUAGES,
+)
 from ha_fleet_agent.dashboard import (
     DASHBOARD_ICON,
     DASHBOARD_URL_PATH,
@@ -255,7 +260,7 @@ def test_builder_alle_entities_vorhanden_erzeugt_alle_sektionen(
     assert len(action_tiles) == 1
 
 
-@pytest.mark.parametrize("lang", ["de", "en"])
+@pytest.mark.parametrize("lang", ["de", "en", "es", "fr", "hr"])
 def test_builder_tile_namen_folgen_sprache(lang):
     """Tile-Names sind sprach-eingebrannt — pro Slot der erwartete Begriff."""
     entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
@@ -278,10 +283,14 @@ def test_builder_tile_namen_folgen_sprache(lang):
 
 
 def test_builder_unbekannte_sprache_faellt_auf_default():
-    """Eine nicht unterstuetzte Sprache → EN (DEFAULT_LANGUAGE)."""
+    """Eine nicht unterstuetzte Sprache → EN (DEFAULT_LANGUAGE).
+
+    ``it`` (Italienisch) ist bewusst NICHT in SUPPORTED_LANGUAGES — fruher
+    stand hier ``fr``, das ist seit 1.5.0 aber selbst eine Plugin-Sprache.
+    """
     entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
 
-    cfg = build_dashboard_config(entity_ids, "fr")
+    cfg = build_dashboard_config(entity_ids, "it")
 
     assert cfg["title"] == _DASHBOARD_TEXTS["en"]["dashboard_title"]
 
@@ -293,6 +302,76 @@ def test_builder_default_sprache_ohne_arg_ist_englisch():
     cfg = build_dashboard_config(entity_ids)
 
     assert cfg["title"] == _DASHBOARD_TEXTS["en"]["dashboard_title"]
+
+
+@pytest.mark.parametrize(
+    "lang,expected_title",
+    [
+        ("es", "Mantenimiento remoto"),
+        ("fr", "Maintenance à distance"),
+        ("hr", "Daljinsko održavanje"),
+    ],
+)
+def test_builder_neue_sprachen_titel_und_vier_sektionen(lang, expected_title):
+    """FR/HR/ES (1.5.0): Titel, Sidebar-Titel und der volle Aufbau (Kopf-
+    Erklaerung + 3 Sektionen) entstehen wie bei DE/EN — sprach-eingebrannt."""
+    entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
+
+    cfg = build_dashboard_config(entity_ids, lang)
+
+    assert cfg["title"] == expected_title
+    assert _DASHBOARD_TEXTS[lang]["sidebar_title"] == expected_title
+    view = cfg["views"][0]
+    # Untertitel laeuft mit der Sprache (kein EN-/DE-Querverweis stehengeblieben)
+    assert view["header"]["card"]["content"] == _DASHBOARD_TEXTS[lang]["header_subtitle"]
+    # Kopf-Erklaerung + 3 Sektionen
+    sections = view["sections"]
+    assert len(sections) == 4
+    # Herkunft transparent (sprachneutraler Markenname im Intro)
+    assert "HA Fleet Manager Agent" in sections[0]["cards"][0]["content"]
+    # Sektions-Headings stammen aus dem Sprach-Dict dieser Sprache
+    headings = [s["cards"][0]["heading"] for s in sections[1:]]
+    assert headings == [
+        _DASHBOARD_TEXTS[lang]["status_section_title"],
+        _DASHBOARD_TEXTS[lang]["control_section_title"],
+        _DASHBOARD_TEXTS[lang]["action_section_title"],
+    ]
+
+
+def test_dashboard_texts_alle_sprachen_strukturgleich():
+    """Jede in SUPPORTED_LANGUAGES gefuehrte Sprache braucht einen vollstaendigen
+    ``_DASHBOARD_TEXTS``-Block mit exakt denselben Keys (inkl. tiles-Subkeys) wie
+    die Referenz DEFAULT_LANGUAGE. Schuetzt vor halb uebersetzten Bloecken, die
+    sonst still auf den Default zurueckfielen (Builder) bzw. KeyErrors werfen."""
+    # Jede unterstuetzte Sprache hat ueberhaupt einen Block.
+    assert set(SUPPORTED_LANGUAGES) <= set(_DASHBOARD_TEXTS)
+
+    ref = _DASHBOARD_TEXTS[DEFAULT_LANGUAGE]
+    ref_keys = set(ref)
+    ref_tiles = set(ref["tiles"])
+
+    for lang in SUPPORTED_LANGUAGES:
+        texts = _DASHBOARD_TEXTS[lang]
+        assert set(texts) == ref_keys, f"Top-Level-Keys weichen ab fuer lang={lang}"
+        assert set(texts["tiles"]) == ref_tiles, f"tiles-Keys weichen ab fuer lang={lang}"
+        # Kein Wert darf leer/None sein (haelt versehentliche Luecken raus).
+        for key, value in texts.items():
+            if key == "tiles":
+                assert all(value.values()), f"Leerer Tile-Name in lang={lang}"
+            else:
+                assert isinstance(value, str) and value.strip(), (
+                    f"Leerer Text fuer key={key} in lang={lang}"
+                )
+
+
+def test_dashboard_texts_deckt_alle_entity_slots_als_tiles_ab():
+    """Jeder ENTITY_SLOT muss in jeder Sprache einen Tile-Namen haben — sonst
+    erschiene eine Karte ohne (oder mit falschem) Namen."""
+    slot_names = {slot for slot, _, _ in ENTITY_SLOTS}
+    for lang in SUPPORTED_LANGUAGES:
+        assert set(_DASHBOARD_TEXTS[lang]["tiles"]) == slot_names, (
+            f"tiles in lang={lang} deckt nicht exakt die ENTITY_SLOTS ab"
+        )
 
 
 def test_builder_ueberspringt_fehlende_entity():
@@ -345,10 +424,17 @@ def test_builder_alle_entities_fehlen_zeigt_nur_kopf_erklaerung():
         ("en", "en"),
         ("en_US", "en"),
         ("en_GB", "en"),
-        ("fr", "en"),
-        ("fr_FR", "en"),
-        ("es", "en"),
-        ("hr", "en"),
+        # Seit 1.5.0 eigenstaendige Plugin-Sprachen — Praefix bleibt erhalten.
+        ("es", "es"),
+        ("es_ES", "es"),
+        ("fr", "fr"),
+        ("fr_FR", "fr"),
+        ("FR", "fr"),
+        ("hr", "hr"),
+        ("hr_HR", "hr"),
+        # Weiterhin NICHT unterstuetzt → DEFAULT_LANGUAGE (en).
+        ("it", "en"),
+        ("nl_NL", "en"),
         ("", "en"),
         (None, "en"),
     ],
@@ -375,15 +461,21 @@ def test_resolve_language_ohne_config_attribut_faellt_auf_default():
         # Endkunden-Wahl gewinnt — auch wenn HA was anderes spricht.
         ("de", "en_US", "de"),
         ("en", "de_DE", "en"),
-        # Kein language im entry → Fallback auf HA-Sprache.
+        # Neue Plugin-Sprachen werden aus entry.data uebernommen.
+        ("fr", "de_DE", "fr"),
+        ("es", "en_US", "es"),
+        ("hr", "de", "hr"),
+        # Kein language im entry → Fallback auf HA-Sprache (jetzt auch fr/es/hr).
         (None, "de_DE", "de"),
         (None, "en_US", "en"),
+        (None, "es_ES", "es"),
+        (None, "fr_FR", "fr"),
         # Unsupported language im entry → Fallback auf HA-Sprache.
         ("klingonisch", "de", "de"),
         ("", "en", "en"),
         # Beide unsupported → DEFAULT_LANGUAGE.
-        ("fr", "fr", "en"),
-        (None, "es_ES", "en"),
+        ("it", "it", "en"),
+        (None, "nl_NL", "en"),
     ],
 )
 def test_lang_from_entry_priorisiert_entry_data_dann_hass(
@@ -499,10 +591,13 @@ async def test_ensure_legt_englisches_dashboard_an_und_setzt_flag(_clean_state):
 @pytest.mark.asyncio
 async def test_ensure_unbekannte_ha_sprache_faellt_auf_englisch(_clean_state):
     """0.7.0-Bestands-Entry ohne ``language``-Feld + nicht unterstuetzte HA-Sprache
-    (Franzoesisch) → Fallback auf DEFAULT_LANGUAGE (``en``)."""
+    (Italienisch) → Fallback auf DEFAULT_LANGUAGE (``en``).
+
+    Fruher stand hier ``fr_FR``; seit 1.5.0 ist Franzoesisch aber selbst eine
+    Plugin-Sprache, daher eine wirklich nicht unterstuetzte Sprache."""
     _install_entities("entry-1")
     lovelace = _FakeLovelaceData()
-    hass = _FakeHass(lovelace, language="fr_FR")
+    hass = _FakeHass(lovelace, language="it_IT")
     # Bewusst KEIN language im entry.data — simuliert 0.7.0-Bestand.
     entry = _FakeEntry("entry-1", data={})
 
