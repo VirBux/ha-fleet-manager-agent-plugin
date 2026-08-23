@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.5.0"
+VERSION = "1.7.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -52,6 +52,98 @@ POLL_INTERVAL_SECONDS = 15
 # ueber genau 5 s (immun gegen Fremdaufrufe, kein "erster Aufruf = 0.0").
 # Laeuft im Executor-Thread (run_in_executor), blockiert den Event-Loop nicht.
 CPU_SAMPLE_INTERVAL_SECONDS = 5.0
+
+# Systemtemperatur (#135). Es gibt keine einheitliche HA-/Supervisor-Quelle:
+# die Supervisor-API (/host/info, /os/info) liefert KEINE Temperatur, und ob ein
+# Sensor ueberhaupt existiert, haengt am Board (RPi/x86 ja, VMs und viele
+# Container-Setups nein). Darum drei Quellen in fester Reihenfolge, jede
+# optional — fehlt alles, bleibt das Feld None und die UI blendet es aus.
+#
+# 1. psutil.sensors_temperatures() — dieselbe Quelle, aus der auch die
+#    systemmonitor-Integration ihren "Processor temperature"-Sensor speist.
+# 2. /sys/class/thermal/thermal_zone*/temp — direkter Kernel-Pfad; greift auf
+#    Boards, deren hwmon-Chip psutil nicht zuordnen kann (haeufig auf ARM).
+# 3. Eine bereits existierende HA-Entity (systemmonitor, Glances, ...).
+#
+# Chip-Namen aus psutil in Prioritaet: Intel (coretemp/x86_pkg_temp),
+# AMD (k10temp/zenpower), ARM/SoC (cpu_thermal/soc_thermal), zuletzt ACPI.
+TEMPERATURE_CHIP_PREFERENCE = (
+    "coretemp",
+    "x86_pkg_temp",
+    "k10temp",
+    "zenpower",
+    "cpu_thermal",
+    "soc_thermal",
+    "acpitz",
+)
+# Chips, die zwar Temperatur liefern, aber NICHT die des Systems/der CPU sind.
+# Ohne diese Sperre koennte der Fallback "irgendein Chip" eine NVMe- oder
+# WLAN-Temperatur als Systemtemperatur ausgeben.
+TEMPERATURE_CHIP_BLOCKLIST = (
+    "nvme",
+    "drivetemp",
+    "iwlwifi",
+    "mt7921",
+    "amdgpu",
+    "nouveau",
+    "ath10k",
+    "ath11k",
+)
+# thermal_zone-Typen, die eine CPU-/SoC-Temperatur bezeichnen (Rest nur Fallback).
+TEMPERATURE_ZONE_PREFERENCE = ("cpu", "soc", "x86_pkg_temp", "pkg")
+# HA-Entities, die bereits eine Prozessortemperatur fuehren (letzte Quelle).
+TEMPERATURE_ENTITY_CANDIDATES = (
+    "sensor.processor_temperature",
+    "sensor.cpu_temperature",
+    "sensor.system_monitor_processor_temperature",
+)
+# Plausibilitaetsfenster in Grad Celsius. Werte ausserhalb sind Sensorfehler
+# (0.0 bei nicht bestueckten Chips, 127.0 als "unbekannt") und werden verworfen.
+TEMPERATURE_MIN_CELSIUS = 1.0
+TEMPERATURE_MAX_CELSIUS = 150.0
+
+# Ursache einer fehlenden Temperatur (#137). Ohne diese Angabe kann die UI nicht
+# zwischen "Sensor liefert gerade nichts" und "geht hier prinzipbedingt nicht"
+# unterscheiden — auf VMs und in Containern ist Letzteres der Normalfall.
+TEMPERATURE_STATUS_OK = "ok"
+TEMPERATURE_STATUS_VIRTUALIZED = "virtualized"
+TEMPERATURE_STATUS_UNAVAILABLE = "unavailable"
+
+# Marker aus /sys/class/dmi/id/* (sys_vendor, product_name, board_vendor,
+# bios_vendor), an denen eine virtualisierte Umgebung erkennbar ist. Der Wert ist
+# der Anzeigename des Hypervisors — er landet nur im Debug-Log, das Backend
+# bekommt ausschliesslich den Status. `systemd-detect-virt` scheidet aus: das
+# Binary fehlt im HA-Container.
+VIRTUALIZATION_DMI_MARKERS = (
+    ("vmware", "VMware"),
+    ("virtualbox", "VirtualBox"),
+    ("innotek", "VirtualBox"),
+    ("qemu", "QEMU/KVM"),
+    ("kvm", "KVM"),
+    ("bochs", "QEMU"),
+    ("xen", "Xen"),
+    ("parallels", "Parallels"),
+    ("bhyve", "bhyve"),
+    ("virtual machine", "Hyper-V"),
+    ("hyper-v", "Hyper-V"),
+    ("openstack", "OpenStack"),
+    # EC2-Bare-Metal-Instanzen (*.metal) melden dieselbe Kennung und sind NICHT
+    # virtualisiert — fuer HA-Installationen praktisch irrelevant, bewusst akzeptiert.
+    ("amazon ec2", "Amazon EC2"),
+    ("google compute engine", "Google Compute Engine"),
+    ("proxmox", "Proxmox"),
+)
+# DMI-Dateien in Lesereihenfolge; sys_vendor trifft am haeufigsten.
+VIRTUALIZATION_DMI_FILES = (
+    "/sys/class/dmi/id/sys_vendor",
+    "/sys/class/dmi/id/product_name",
+    "/sys/class/dmi/id/board_vendor",
+    "/sys/class/dmi/id/bios_vendor",
+)
+# Xen meldet sich direkt im Sysfs; das CPU-Flag "hypervisor" setzt jede gaengige
+# VM und dient als letzter Marker. Als Konstanten, damit Tests darauf zeigen koennen.
+VIRTUALIZATION_HYPERVISOR_FILE = "/sys/hypervisor/type"
+VIRTUALIZATION_CPUINFO_FILE = "/proc/cpuinfo"
 
 # Reconnect nach unerwartetem Tunnel-Abriss (#108 Phase C).
 # Bricht der Tunnel weg, OBWOHL die Wartungs-Session noch laeuft (z.B. geplanter

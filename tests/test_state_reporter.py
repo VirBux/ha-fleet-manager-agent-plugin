@@ -8,7 +8,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ha_fleet_agent import state_reporter as state_reporter_module
 from ha_fleet_agent.state_reporter import StateReporter
+
+# Die autouse-Fixture unten ersetzt `_read_virtualization` durch einen Stub, damit
+# kein Test am sysfs des Runners haengt. Die Tests, die genau diese Erkennung
+# pruefen, brauchen die echte Implementierung — hier vor dem Patchen festhalten.
+_REAL_READ_VIRTUALIZATION = StateReporter._read_virtualization
 
 
 # --------------------------------------------------------- Stubs
@@ -68,6 +74,8 @@ def _disable_external_stats(monkeypatch):
 
     - `_fetch_core_stats_via_supervisor_api`: kein echter HTTP-Call an Supervisor.
     - `_fetch_host_stats_via_psutil`: kein echter Read auf /proc/* der Test-Maschine.
+    - Temperatur-Leser (#135): kein echter Read auf hwmon/thermal_zone der
+      Test-Maschine — sonst haengt das Ergebnis an der Hardware des CI-Runners.
 
     Tests, die eine konkrete Quelle prüfen wollen, patchen die jeweilige
     Methode pro Test erneut.
@@ -78,6 +86,11 @@ def _disable_external_stats(monkeypatch):
     from ha_fleet_agent.state_reporter import StateReporter as _SR
     monkeypatch.setattr(_SR, "_fetch_core_stats_via_supervisor_api", _none)
     monkeypatch.setattr(_SR, "_fetch_host_stats_via_psutil", _none)
+    monkeypatch.setattr(_SR, "_read_temperature_psutil", staticmethod(lambda: None))
+    monkeypatch.setattr(_SR, "_read_temperature_thermal_zone", staticmethod(lambda: None))
+    # Virtualisierungserkennung (#137): kein Read auf sysfs des Runners — sonst
+    # haengt `temperature_status` daran, ob die CI selbst in einer VM laeuft.
+    monkeypatch.setattr(_SR, "_read_virtualization", staticmethod(lambda: None))
     yield
 
 
@@ -1084,3 +1097,226 @@ async def test_errors_ist_null_ohne_fehler_logs():
     # Keine WARNING-Logs ⇒ warnings-Zaehler 0 (kein Badge), auch wenn HA offene
     # Persistent Notifications wie "Update verfuegbar" hat — die zaehlen nicht mehr.
     assert payload["warnings"] == 0
+
+
+# --------------------------------------------------- Systemtemperatur (#135)
+
+
+@pytest.mark.asyncio
+async def test_temperature_fehlt_ohne_sensor():
+    """Ohne jeden Sensor bleibt `temperature_celsius` None — kein Wert erfunden.
+
+    Der Regelfall auf VMs und Container-Setups. Die UI blendet die Anzeige dann
+    aus, statt 0 °C zu zeigen.
+    """
+    session = FakeSession(response_status=200)
+    hass = FakeHass()
+
+    reporter = StateReporter(
+        hass, "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    payload = session.calls[0]["json"]
+    assert "temperature_celsius" in payload, "Feld muss immer im Payload stehen"
+    assert payload["temperature_celsius"] is None
+
+
+@pytest.mark.asyncio
+async def test_temperature_aus_psutil_landet_im_payload(monkeypatch):
+    """Liefert psutil einen Wert, steht er im Payload (erste Quelle gewinnt)."""
+    from ha_fleet_agent.state_reporter import StateReporter as _SR
+    monkeypatch.setattr(_SR, "_read_temperature_psutil", staticmethod(lambda: 47.5))
+
+    session = FakeSession(response_status=200)
+    hass = FakeHass()
+
+    reporter = StateReporter(
+        hass, "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    assert session.calls[0]["json"]["temperature_celsius"] == 47.5
+
+
+@pytest.mark.asyncio
+async def test_temperature_faellt_auf_thermal_zone_zurueck(monkeypatch):
+    """Ohne psutil-Treffer greift /sys/class/thermal."""
+    from ha_fleet_agent.state_reporter import StateReporter as _SR
+    monkeypatch.setattr(_SR, "_read_temperature_thermal_zone", staticmethod(lambda: 52.3))
+
+    session = FakeSession(response_status=200)
+    hass = FakeHass()
+
+    reporter = StateReporter(
+        hass, "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    assert session.calls[0]["json"]["temperature_celsius"] == 52.3
+
+
+def test_best_reading_nimmt_hoechsten_plausiblen_wert():
+    """Ein Chip meldet mehrere Kerne — der waermste zaehlt, Artefakte fliegen raus."""
+
+    class _Entry:
+        def __init__(self, current):
+            self.current = current
+
+    # 0.0 = unbestueckter Sensor, 250.0 = ausserhalb des Plausibilitaetsfensters.
+    entries = [_Entry(0.0), _Entry(41.0), _Entry(48.0), _Entry(250.0)]
+    assert StateReporter._best_reading(entries) == 48.0
+    assert StateReporter._best_reading([_Entry(0.0)]) is None
+    assert StateReporter._best_reading([]) is None
+
+
+def test_temperature_entity_rechnet_fahrenheit_um():
+    """Eine HA-Entity in °F wird auf Celsius umgerechnet (Payload ist immer °C)."""
+
+    class _State:
+        state = "122.0"
+        attributes = {"unit_of_measurement": "°F"}
+
+    hass = FakeHass()
+    hass.states.get = MagicMock(
+        side_effect=lambda eid: _State() if eid == "sensor.processor_temperature" else None
+    )
+    reporter = StateReporter(
+        hass, "e1", FakeSession(response_status=200), "https://api.ha-fleet-manager.com", "key"
+    )
+
+    assert reporter._read_temperature_entity() == 50.0
+
+
+# ------------------------------------- Ursache fehlender Temperatur (#137)
+
+
+@pytest.mark.asyncio
+async def test_temperature_status_ok_bei_wert(monkeypatch):
+    """Liegt ein Messwert vor, meldet der Status `ok`."""
+    from ha_fleet_agent.state_reporter import StateReporter as _SR
+    monkeypatch.setattr(_SR, "_read_temperature_psutil", staticmethod(lambda: 47.5))
+
+    session = FakeSession(response_status=200)
+    reporter = StateReporter(
+        FakeHass(), "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    assert session.calls[0]["json"]["temperature_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_temperature_status_unavailable_ohne_sensor_und_ohne_vm():
+    """Kein Sensor, keine VM erkennbar: `unavailable` — Sensor fehlt oder ist unsichtbar."""
+    session = FakeSession(response_status=200)
+    reporter = StateReporter(
+        FakeHass(), "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    assert session.calls[0]["json"]["temperature_status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_temperature_status_virtualized_auf_vm(monkeypatch):
+    """Ohne Sensor, aber erkennbarer Hypervisor: `virtualized`.
+
+    Das ist die Unterscheidung, um die es in #137 geht — die UI kann dann sagen
+    "geht hier prinzipbedingt nicht" statt "gerade kein Wert".
+    """
+    from ha_fleet_agent.state_reporter import StateReporter as _SR
+    monkeypatch.setattr(_SR, "_read_virtualization", staticmethod(lambda: "VirtualBox"))
+
+    session = FakeSession(response_status=200)
+    reporter = StateReporter(
+        FakeHass(), "e1", session, "https://api.ha-fleet-manager.com", "key"
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+
+    assert session.calls[0]["json"]["temperature_status"] == "virtualized"
+
+
+@pytest.mark.asyncio
+async def test_virtualisierungserkennung_wird_nur_einmal_gelesen(monkeypatch):
+    """Die Erkennung liest sysfs — das darf nicht bei jedem 60-s-Push passieren."""
+    calls = {"n": 0}
+
+    def _read():
+        calls["n"] += 1
+        return None
+
+    from ha_fleet_agent.state_reporter import StateReporter as _SR
+    monkeypatch.setattr(_SR, "_read_virtualization", staticmethod(_read))
+
+    reporter = StateReporter(
+        FakeHass(), "e1", FakeSession(response_status=200),
+        "https://api.ha-fleet-manager.com", "key",
+    )
+    with patch.object(reporter, "_fetch_supervisor_info", return_value=(None, None, None)):
+        await reporter._push_once()
+        await reporter._push_once()
+
+    assert calls["n"] == 1
+
+
+def test_read_virtualization_erkennt_dmi_marker(monkeypatch, tmp_path):
+    """Ein DMI-Eintrag wie "innotek GmbH" identifiziert die VM (hier VirtualBox)."""
+    dmi = tmp_path / "sys_vendor"
+    dmi.write_text("innotek GmbH", encoding="utf-8")
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_DMI_FILES", (str(dmi),)
+    )
+    # Auch die beiden Nachbarquellen umlenken — sonst haengt das Ergebnis daran, ob
+    # der Runner selbst virtualisiert ist (auf einem Xen-Host greift /sys/hypervisor/type
+    # zuerst).
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_HYPERVISOR_FILE", str(tmp_path / "fehlt")
+    )
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_CPUINFO_FILE", str(tmp_path / "fehlt-auch")
+    )
+
+    assert _REAL_READ_VIRTUALIZATION() == "VirtualBox"
+
+
+def test_read_virtualization_meldet_bare_metal_nicht_als_vm(monkeypatch, tmp_path):
+    """Gewoehnliche Hardware ohne Hypervisor-Flag darf nicht als VM gelten."""
+    dmi = tmp_path / "sys_vendor"
+    dmi.write_text("ASUSTeK COMPUTER INC.", encoding="utf-8")
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("flags   : fpu vme de pse tsc msr", encoding="utf-8")
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_DMI_FILES", (str(dmi),)
+    )
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_HYPERVISOR_FILE",
+        str(tmp_path / "fehlt"),
+    )
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_CPUINFO_FILE", str(cpuinfo)
+    )
+
+    assert _REAL_READ_VIRTUALIZATION() is None
+
+
+def test_read_virtualization_erkennt_hypervisor_cpu_flag(monkeypatch, tmp_path):
+    """Ohne DMI-Treffer verraet das CPU-Flag `hypervisor` die VM."""
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("flags   : fpu vme de pse tsc hypervisor", encoding="utf-8")
+    monkeypatch.setattr(state_reporter_module, "VIRTUALIZATION_DMI_FILES", ())
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_HYPERVISOR_FILE",
+        str(tmp_path / "fehlt"),
+    )
+    monkeypatch.setattr(
+        state_reporter_module, "VIRTUALIZATION_CPUINFO_FILE", str(cpuinfo)
+    )
+
+    assert _REAL_READ_VIRTUALIZATION() == "unidentified hypervisor"

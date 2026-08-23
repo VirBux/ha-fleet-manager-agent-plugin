@@ -41,7 +41,20 @@ from .const import (
     MAX_WARNING_LOGS,
     SIGNAL_CONNECTION_STATE,
     STATE_UPDATE_INTERVAL_SECONDS,
+    TEMPERATURE_CHIP_BLOCKLIST,
+    TEMPERATURE_CHIP_PREFERENCE,
+    TEMPERATURE_ENTITY_CANDIDATES,
+    TEMPERATURE_MAX_CELSIUS,
+    TEMPERATURE_MIN_CELSIUS,
+    TEMPERATURE_STATUS_OK,
+    TEMPERATURE_STATUS_UNAVAILABLE,
+    TEMPERATURE_STATUS_VIRTUALIZED,
+    TEMPERATURE_ZONE_PREFERENCE,
     VERSION,
+    VIRTUALIZATION_CPUINFO_FILE,
+    VIRTUALIZATION_DMI_FILES,
+    VIRTUALIZATION_DMI_MARKERS,
+    VIRTUALIZATION_HYPERVISOR_FILE,
     WARNING_LOG_LEVELS,
 )
 
@@ -92,6 +105,10 @@ class StateReporter:
         self._api_key = api_key
         self._started_at = time.monotonic()
         self._unsub_interval = None
+        # Virtualisierungserkennung (#137): einmal ermitteln, dann cachen — die
+        # Hardware wechselt zur Laufzeit nicht.
+        self._virtualization: str | None = None
+        self._virtualization_checked = False
 
     def start(self) -> None:
         """Sofort einen Payload senden und das Intervall registrieren."""
@@ -251,6 +268,14 @@ class StateReporter:
         payload["disk_percent"] = self._safe(
             lambda: self._percent(host_info, "disk_used", "disk_total")
         )
+        # Systemtemperatur (#135). Optional: existiert nur, wenn das Board einen
+        # Sensor hat — auf VMs und vielen Container-Setups bleibt der Wert None.
+        # Dann sagt `temperature_status` (#137), warum: erkennbar virtualisiert
+        # ("geht hier prinzipbedingt nicht") oder schlicht kein Sensor gefunden.
+        temperature, temperature_source = await self._resolve_temperature()
+        payload["temperature_celsius"] = temperature
+        payload["temperature_status"] = await self._resolve_temperature_status(temperature)
+
         payload["ip"] = self._safe(lambda: self._resolve_ip(host_info))
         payload["addons"] = self._safe(
             lambda: self._list_addons(supervisor_info)
@@ -261,13 +286,16 @@ class StateReporter:
 
         # Diagnose-Log: ohne PII, Quelle pro Feld — hilft beim Bug-Triaging.
         _LOGGER.debug(
-            "State-Payload aufgebaut — ha_version=%s cpu=%s(%s) ram=%s(%s) disk=%s ip=%s addons=%d updates=%d",
+            "State-Payload aufgebaut — ha_version=%s cpu=%s(%s) ram=%s(%s) disk=%s temp=%s(%s,%s) ip=%s addons=%d updates=%d",
             payload.get("ha_version"),
             payload.get("cpu_percent"),
             cpu_source,
             payload.get("ram_percent"),
             ram_source,
             payload.get("disk_percent"),
+            payload.get("temperature_celsius"),
+            temperature_source,
+            payload.get("temperature_status"),
             payload.get("ip"),
             len(payload.get("addons", [])),
             len(payload.get("updates", [])),
@@ -381,6 +409,246 @@ class StateReporter:
         except Exception:  # noqa: BLE001 — psutil-Fehler dürfen nichts crashen
             _LOGGER.debug("psutil Aufruf fehlgeschlagen", exc_info=True)
             return None
+
+    # --------------------------------------------------- Systemtemperatur (#135)
+
+    async def _resolve_temperature(self) -> tuple[float | None, str]:
+        """Ermittelt die Systemtemperatur in Grad Celsius.
+
+        Es gibt keine einheitliche Quelle: die Supervisor-API liefert keine
+        Temperatur, und ob ueberhaupt ein Sensor existiert, haengt am Board.
+        Darum drei Quellen in fester Reihenfolge (Begruendung in const.py):
+        psutil-hwmon -> /sys/class/thermal -> vorhandene HA-Entity.
+
+        Die beiden datei-basierten Quellen laufen im Executor — sie lesen sysfs
+        und duerfen den Event-Loop nicht blockieren.
+
+        Rueckgabe: (Wert oder None, Quellen-String fuers Diagnose-Log).
+        """
+        loop = asyncio.get_running_loop()
+
+        for source, reader in (
+            ("psutil", self._read_temperature_psutil),
+            ("thermal_zone", self._read_temperature_thermal_zone),
+        ):
+            try:
+                value = await loop.run_in_executor(None, reader)
+            except Exception:  # noqa: BLE001 — Sensor-Fehler duerfen nichts crashen
+                _LOGGER.debug("Temperaturquelle %s fehlgeschlagen", source, exc_info=True)
+                continue
+            if value is not None:
+                return value, source
+
+        value = self._safe(self._read_temperature_entity)
+        if value is not None:
+            return value, "ha_entity"
+
+        return None, "none"
+
+    async def _resolve_temperature_status(self, temperature: float | None) -> str:
+        """Begruendet eine fehlende Temperatur (#137).
+
+        Ohne Ursache kann die UI nicht zwischen "Sensor liefert gerade nichts"
+        und "geht auf dieser Installation prinzipbedingt nicht" unterscheiden.
+        Genau das ist auf virtualisierten Systemen der Normalfall: der Gast sieht
+        keine Hardware-Sensoren, egal welches Plugin laeuft.
+
+        - ``ok``: ein Wert liegt vor.
+        - ``virtualized``: kein Wert, aber die Umgebung ist erkennbar eine VM.
+        - ``unavailable``: kein Wert und keine VM erkennbar (Sensor fehlt oder ist
+          im Container nicht sichtbar).
+        """
+        if temperature is not None:
+            return TEMPERATURE_STATUS_OK
+
+        hypervisor = await self._detect_virtualization()
+        if hypervisor is not None:
+            return TEMPERATURE_STATUS_VIRTUALIZED
+        return TEMPERATURE_STATUS_UNAVAILABLE
+
+    async def _detect_virtualization(self) -> str | None:
+        """Erkennt eine virtualisierte Umgebung; liefert den Hypervisor-Namen oder None.
+
+        Das Ergebnis wird gecacht: die Hardware wechselt zur Laufzeit nicht, und
+        die Erkennung liest sysfs — das soll nicht alle 60 s passieren. Der Read
+        laeuft im Executor, damit der Event-Loop nicht blockiert.
+        """
+        if self._virtualization_checked:
+            return self._virtualization
+        try:
+            loop = asyncio.get_running_loop()
+            self._virtualization = await loop.run_in_executor(None, self._read_virtualization)
+        except Exception:  # noqa: BLE001 — Erkennung darf nie den Push kippen
+            _LOGGER.debug("Virtualisierungserkennung fehlgeschlagen", exc_info=True)
+            self._virtualization = None
+        self._virtualization_checked = True
+        _LOGGER.debug("Virtualisierung erkannt: %s", self._virtualization or "nein")
+        return self._virtualization
+
+    @staticmethod
+    def _read_virtualization() -> str | None:
+        """Liest die drei verlaesslichen Virtualisierungs-Marker unter Linux.
+
+        `systemd-detect-virt` scheidet aus — das Binary fehlt im HA-Container.
+        Stattdessen: Xen-Sysfs, DMI-Kennungen und zuletzt das CPU-Flag
+        ``hypervisor``, das jede gaengige VM setzt. Container auf echter Hardware
+        bleiben damit korrekt unerkannt; die melden ``unavailable``.
+        """
+        try:
+            with open(VIRTUALIZATION_HYPERVISOR_FILE, encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if value:
+                return value.capitalize()
+        except OSError:
+            pass
+
+        for path in VIRTUALIZATION_DMI_FILES:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    content = handle.read().strip().lower()
+            except OSError:
+                continue
+            if not content:
+                continue
+            for marker, name in VIRTUALIZATION_DMI_MARKERS:
+                if marker in content:
+                    return name
+
+        try:
+            with open(VIRTUALIZATION_CPUINFO_FILE, encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.startswith("flags"):
+                        continue
+                    if "hypervisor" in line.split(":", 1)[-1].split():
+                        # Das Flag verraet nur DASS virtualisiert wird, nicht womit.
+                        return "unidentified hypervisor"
+                    break
+        except OSError:
+            pass
+
+        return None
+
+    @classmethod
+    def _read_temperature_psutil(cls) -> float | None:
+        """Liest die hoechste plausible CPU-/SoC-Temperatur via psutil.
+
+        `sensors_temperatures()` gibt es nur auf Linux und nur, wenn hwmon im
+        Container sichtbar ist; sonst fehlt das Attribut oder das Dict ist leer.
+        Bevorzugt werden bekannte CPU-Chips, danach jeder nicht gesperrte Chip —
+        die Blockliste haelt NVMe-/WLAN-Temperaturen heraus.
+        """
+        try:
+            import psutil  # noqa: PLC0415 — Lazy-Import wie bei den CPU/RAM-Stats
+        except ImportError:
+            return None
+
+        reader = getattr(psutil, "sensors_temperatures", None)
+        if reader is None:
+            return None
+
+        readings = reader() or {}
+
+        for chip in TEMPERATURE_CHIP_PREFERENCE:
+            value = cls._best_reading(readings.get(chip))
+            if value is not None:
+                return value
+
+        for chip, entries in readings.items():
+            lowered = str(chip).lower()
+            if any(blocked in lowered for blocked in TEMPERATURE_CHIP_BLOCKLIST):
+                continue
+            value = cls._best_reading(entries)
+            if value is not None:
+                return value
+
+        return None
+
+    @classmethod
+    def _read_temperature_thermal_zone(cls) -> float | None:
+        """Liest /sys/class/thermal/thermal_zone*/temp (Milligrad Celsius).
+
+        Greift auf Boards, deren hwmon-Chip psutil nicht zuordnen kann. Zonen
+        mit CPU-/SoC-Typ haben Vorrang; ohne Treffer gewinnt die waermste
+        plausible Zone.
+        """
+        base = "/sys/class/thermal"
+        try:
+            zones = sorted(z for z in os.listdir(base) if z.startswith("thermal_zone"))
+        except OSError:
+            return None
+
+        preferred: list[float] = []
+        others: list[float] = []
+        for zone in zones:
+            try:
+                with open(f"{base}/{zone}/temp", encoding="utf-8") as handle:
+                    value = cls._plausible(int(handle.read().strip()) / 1000)
+            except (OSError, ValueError):
+                continue
+            if value is None:
+                continue
+            try:
+                with open(f"{base}/{zone}/type", encoding="utf-8") as handle:
+                    zone_type = handle.read().strip().lower()
+            except OSError:
+                zone_type = ""
+            if any(marker in zone_type for marker in TEMPERATURE_ZONE_PREFERENCE):
+                preferred.append(value)
+            else:
+                others.append(value)
+
+        candidates = preferred or others
+        return max(candidates) if candidates else None
+
+    def _read_temperature_entity(self) -> float | None:
+        """Letzte Quelle: eine bereits vorhandene HA-Entity (systemmonitor & Co.).
+
+        Fahrenheit-Anzeigen werden umgerechnet — Payload und Backend fuehren
+        ausschliesslich Grad Celsius.
+        """
+        for entity_id in TEMPERATURE_ENTITY_CANDIDATES:
+            state = self._hass.states.get(entity_id)
+            if state is None:
+                continue
+            # HA fuehrt States immer als String — alles andere (None, "unknown",
+            # "unavailable") ist kein Messwert.
+            raw_state = getattr(state, "state", None)
+            if not isinstance(raw_state, str):
+                continue
+            try:
+                raw = float(raw_state)
+            except ValueError:
+                continue
+            unit = (getattr(state, "attributes", None) or {}).get("unit_of_measurement")
+            if isinstance(unit, str) and unit.strip().upper().endswith("F"):
+                raw = (raw - 32) * 5 / 9
+            value = self._plausible(raw)
+            if value is not None:
+                return value
+        return None
+
+    @classmethod
+    def _best_reading(cls, entries: Any) -> float | None:
+        """Hoechster plausibler `current`-Wert eines Chips (Package/Hotspot gewinnt)."""
+        if not entries:
+            return None
+        values = [
+            value
+            for value in (cls._plausible(getattr(entry, "current", None)) for entry in entries)
+            if value is not None
+        ]
+        return max(values) if values else None
+
+    @staticmethod
+    def _plausible(raw: Any) -> float | None:
+        """Verwirft Sensor-Artefakte (0.0 bei unbestuecktem Chip, 127.0 = unbekannt)."""
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not TEMPERATURE_MIN_CELSIUS <= value <= TEMPERATURE_MAX_CELSIUS:
+            return None
+        return round(value, 1)
 
     # --------------------------------------------------------- Helper
 
