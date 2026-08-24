@@ -56,6 +56,7 @@ from .integrator_user import IntegratorUserManager
 from .reconnect import TunnelReconnector
 from .remote_access import RemoteAccessManager
 from .request_poller import RequestPoller
+from .restart_handler import RestartHandler
 from .state_reporter import StateReporter
 from .tunnel import TunnelForwarder
 from .update_handler import UpdateCommandHandler
@@ -68,6 +69,7 @@ DATA_STATE_REPORTER = "state_reporter"
 DATA_REQUEST_POLLER = "request_poller"
 DATA_UPDATE_HANDLER = "update_handler"
 DATA_CLEAR_LOGS_HANDLER = "clear_logs_handler"
+DATA_RESTART_HANDLER = "restart_handler"
 DATA_RECONNECTOR = "reconnector"
 DATA_HTTP_SESSION = "http_session"
 
@@ -292,6 +294,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # State-Push an (frischer, leerer Log-Snapshot ohne Wartezeit).
     clear_logs_handler = ClearLogsHandler(hass, state_reporter)
     request_poller.register_handler("clear_logs", clear_logs_handler.handle)
+    # System-Neustart (#127, Sofort-Weg): das Backend liefert in ruhigen Ticks die
+    # Action "restart", wenn der Integrator im Dashboard "System neu starten" bestaetigt
+    # hat. Der Handler ruft homeassistant.restart — danach ist der Agent bis zum
+    # Wiederanlauf offline (kein State-Push mehr moeglich).
+    restart_handler = RestartHandler(hass)
+    request_poller.register_handler("restart", restart_handler.handle)
 
     hass.data[DOMAIN][entry.entry_id] = {
         CONF_API_KEY: api_key,
@@ -306,6 +314,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_RECONNECTOR: reconnector,
         DATA_UPDATE_HANDLER: update_handler,
         DATA_CLEAR_LOGS_HANDLER: clear_logs_handler,
+        DATA_RESTART_HANDLER: restart_handler,
         DATA_DEVICE_INFO: build_device_info(entry.entry_id, backend_url),
     }
 
