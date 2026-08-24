@@ -298,7 +298,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Action "restart", wenn der Integrator im Dashboard "System neu starten" bestaetigt
     # hat. Der Handler ruft homeassistant.restart — danach ist der Agent bis zum
     # Wiederanlauf offline (kein State-Push mehr moeglich).
-    restart_handler = RestartHandler(hass)
+    # Der Handler quittiert den Neustart vor dem Service-Aufruf ans Backend (#127,
+    # Rueckmeldung) — dafuer braucht er Session, Backend-URL und Key.
+    restart_handler = RestartHandler(
+        hass,
+        session=http_session,
+        backend_url=backend_url,
+        api_key=api_key,
+    )
     request_poller.register_handler("restart", restart_handler.handle)
 
     hass.data[DOMAIN][entry.entry_id] = {
