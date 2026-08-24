@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -36,8 +37,22 @@ class FakeServices:
 
 
 class FakeHass:
+    """hass-Stub. ``async_create_task`` fuehrt den Batch als echten Task aus — der
+    Handler kehrt sofort zurueck, die Tests warten ueber :meth:`settle` auf ihn."""
+
     def __init__(self, fail_for: set[str] | None = None):
         self.services = FakeServices(fail_for)
+        self.tasks: list[asyncio.Task] = []
+
+    def async_create_task(self, coro, name: str | None = None):  # noqa: ANN001
+        task = asyncio.get_running_loop().create_task(coro, name=name)
+        self.tasks.append(task)
+        return task
+
+    async def settle(self) -> None:
+        """Wartet, bis alle gestarteten Hintergrund-Tasks durch sind."""
+        if self.tasks:
+            await asyncio.gather(*self.tasks)
 
 
 class _FakeResponse:
@@ -69,6 +84,12 @@ def _handler(hass: FakeHass, session: FakeSession) -> UpdateCommandHandler:
     )
 
 
+async def _run(handler: UpdateCommandHandler, hass: FakeHass, payload: dict) -> None:
+    """handle() anstossen und den Hintergrund-Batch auslaufen lassen."""
+    await handler.handle(payload)
+    await hass.settle()
+
+
 def _report_by_command(session: FakeSession) -> dict[str, dict]:
     """Mappt commandId -> Report-Body (URL-Schema .../update-commands/<id>/report)."""
     return {p["url"].split("/")[-2]: p["json"] for p in session.posts}
@@ -82,7 +103,7 @@ async def test_einzelner_command_loest_install_aus_und_meldet_started():
     """Ein Command: update.install mit entity_id + Report {status: started}."""
     hass = FakeHass()
     session = FakeSession()
-    await _handler(hass, session).handle(
+    await _run(_handler(hass, session), hass, 
         {
             "action": "update_batch",
             "commands": [
@@ -96,7 +117,9 @@ async def test_einzelner_command_loest_install_aus_und_meldet_started():
     assert call["domain"] == "update"
     assert call["service"] == "install"
     assert call["data"] == {"entity_id": "update.terminal_ssh_update"}
-    assert call["blocking"] is False  # nicht-blockierend (Research §6)
+    # blocking=True: nur so schlaegt ein fehlgeschlagenes update.install bis zu uns
+    # durch. Den Poll-Tick haelt das nicht auf — der Batch laeuft im eigenen Task.
+    assert call["blocking"] is True
 
     assert len(session.posts) == 1
     post = session.posts[0]
@@ -113,7 +136,7 @@ async def test_version_und_backup_nur_wenn_gesetzt():
     """version/backup gehen nur mit, wenn gesetzt — sonst nur entity_id."""
     hass = FakeHass()
     session = FakeSession()
-    await _handler(hass, session).handle(
+    await _run(_handler(hass, session), hass, 
         {
             "commands": [
                 {
@@ -141,7 +164,7 @@ async def test_backup_false_wird_nicht_mitgesendet():
     """backup=False ist der Default und soll nicht explizit mitgehen."""
     hass = FakeHass()
     session = FakeSession()
-    await _handler(hass, session).handle(
+    await _run(_handler(hass, session), hass, 
         {"commands": [{"commandId": "c1", "entity_id": "update.x", "backup": False}]}
     )
     assert "backup" not in hass.services.calls[0]["data"]
@@ -152,7 +175,7 @@ async def test_sequenziell_und_fehler_bricht_kette_nicht():
     """Ein fehlschlagendes update.install meldet 'failed', stoppt aber die Kette nicht."""
     hass = FakeHass(fail_for={"update.boom"})
     session = FakeSession()
-    await _handler(hass, session).handle(
+    await _run(_handler(hass, session), hass, 
         {
             "commands": [
                 {"commandId": "c1", "entity_id": "update.boom"},
@@ -177,7 +200,7 @@ async def test_tolerant_camel_und_snake_case():
     """commandId/command_id und entityId/entity_id werden beide akzeptiert."""
     hass = FakeHass()
     session = FakeSession()
-    await _handler(hass, session).handle(
+    await _run(_handler(hass, session), hass, 
         {
             "commands": [
                 {"command_id": "c1", "entity_id": "update.a"},
@@ -200,9 +223,9 @@ async def test_leere_oder_fehlende_commands_tut_nichts():
     hass = FakeHass()
     session = FakeSession()
     handler = _handler(hass, session)
-    await handler.handle({"action": "update_batch"})
-    await handler.handle({"commands": []})
-    await handler.handle({"commands": "kein-array"})
+    await _run(handler, hass, {"action": "update_batch"})
+    await _run(handler, hass, {"commands": []})
+    await _run(handler, hass, {"commands": "kein-array"})
     assert hass.services.calls == []
     assert session.posts == []
 
@@ -212,7 +235,7 @@ async def test_command_ohne_id_oder_entity_uebersprungen():
     """Commands ohne commandId oder entity_id werden uebersprungen (kein Install)."""
     hass = FakeHass()
     session = FakeSession()
-    await _handler(hass, session).handle(
+    await _run(_handler(hass, session), hass, 
         {
             "commands": [
                 {"commandId": "c1"},  # keine entity_id
@@ -245,7 +268,46 @@ async def test_report_netzwerkfehler_kein_crash():
     handler = UpdateCommandHandler(
         hass, _BoomSession(), "https://api.ha-fleet-manager.com", "key"
     )
-    await handler.handle(
+    await _run(handler, hass, 
         {"commands": [{"commandId": "c1", "entity_id": "update.x"}]}
     )
     assert len(hass.services.calls) == 1  # Install lief, Report-Fehler abgefangen
+
+
+@pytest.mark.asyncio
+async def test_fehlschlag_korrigiert_das_gemeldete_started():
+    """Erst „started", dann „failed" — ein still fehlschlagendes Update darf in der
+    App nicht als „laeuft" stehen bleiben (blocking=True macht den Fehler sichtbar)."""
+    hass = FakeHass(fail_for={"update.boom"})
+    session = FakeSession()
+    await _run(
+        _handler(hass, session),
+        hass,
+        {"commands": [{"commandId": "c1", "entity_id": "update.boom"}]},
+    )
+
+    assert [p["json"]["status"] for p in session.posts] == ["started", "failed"]
+    assert "install failed" in session.posts[1]["json"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_abbruch_beim_ha_neustart_meldet_keinen_fehlschlag():
+    """Bricht der Task ab, weil HA herunterfaehrt (Core/OS-Update), ist das kein
+    Fehlschlag — der Abschluss klaert der State-Push nach dem Neustart."""
+
+    class _ShutdownServices(FakeServices):
+        async def async_call(self, domain, service, service_data=None, blocking=False):  # noqa: ANN001
+            await super().async_call(domain, service, service_data, blocking)
+            raise asyncio.CancelledError
+
+    hass = FakeHass()
+    hass.services = _ShutdownServices()
+    session = FakeSession()
+    with pytest.raises(asyncio.CancelledError):
+        await _run(
+            _handler(hass, session),
+            hass,
+            {"commands": [{"commandId": "c1", "entity_id": "update.core"}]},
+        )
+
+    assert [p["json"]["status"] for p in session.posts] == ["started"]

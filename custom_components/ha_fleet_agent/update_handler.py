@@ -6,14 +6,19 @@ Command ein nicht-blockierender ``update.install``-Service-Call, danach sofort e
 Report ans Backend (``started`` | ``failed``). Ein Fehler pro Command bricht die
 Kette **nicht** ab — die restlichen Commands laufen weiter.
 
-Fortschritt/Ergebnis wird hier NICHT abgewartet (``update.install`` ist
-nicht-blockierend, Research §6): Den Abschluss erkennt das Backend am naechsten
-60-s-State-Push, sobald die Ziel-``update``-Entity nicht mehr ``update_available``
-ist. Der serverseitige Watchdog re-queued Commands, die nie quittiert werden.
+Den **Abschluss** erkennt das Backend am naechsten 60-s-State-Push, sobald die
+Ziel-``update``-Entity ihr Ziel meldet. Ein **Fehlschlag** dagegen wird hier gemeldet:
+Der Batch laeuft in einem eigenen Hintergrund-Task, darin jeder ``update.install`` mit
+``blocking=True``. Frueher lief der Call mit ``blocking=False`` — dann kehrte er sofort
+zurueck, und eine Exception aus HACS/Supervisor verschwand spurlos in Home Assistant:
+Die App zeigte weiter „laeuft"/„Neustart erforderlich", obwohl nie etwas installiert
+wurde. Der Hintergrund-Task haelt zugleich den Poll-Tick frei (der Poller ist
+reentrancy-geschuetzt, ein Add-on-Pull wuerde ihn sonst minutenlang blockieren).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -50,8 +55,9 @@ class UpdateCommandHandler:
         """Poll-Handler fuer ``action == "update_batch"``.
 
         Erwartet ``data["commands"]`` = Liste von
-        ``{commandId, entity_id, version?, backup?}``. Arbeitet sie sequenziell ab;
-        jeder Command wird einzeln ausgefuehrt und quittiert.
+        ``{commandId, entity_id, version?, backup?}``. Startet die Abarbeitung als
+        Hintergrund-Task und kehrt sofort zurueck — die Commands laufen darin
+        sequenziell, jeder wird einzeln ausgefuehrt und quittiert.
         """
         commands = data.get("commands")
         if not isinstance(commands, list) or not commands:
@@ -59,6 +65,14 @@ class UpdateCommandHandler:
             return
 
         _LOGGER.info("update_batch: %d Command(s) werden abgearbeitet", len(commands))
+        # Eigener Task: ``update.install`` laeuft blockierend (nur so bekommen wir einen
+        # Fehlschlag mit), darf aber den Poll-Tick nicht aufhalten.
+        self._hass.async_create_task(
+            self._run_batch(commands), name="hafm_update_batch"
+        )
+
+    async def _run_batch(self, commands: list[Any]) -> None:
+        """Arbeitet die Commands des Batches sequenziell ab."""
         for cmd in commands:
             if isinstance(cmd, dict):
                 await self._run_one(cmd)
@@ -89,13 +103,30 @@ class UpdateCommandHandler:
         if cmd.get("backup"):
             service_data["backup"] = True
 
+        # „started" sofort, bevor der Call laeuft: die App soll den Zustand direkt
+        # zeigen, nicht erst nach Minuten. Ein spaeterer Fehlschlag korrigiert ihn.
+        _LOGGER.info(
+            "update.install ausgeloest fuer %s (command=%s)", entity_id, command_id
+        )
+        await self._report(command_id, REPORT_STARTED)
+
         try:
-            # blocking=False: update.install ist langlaufend (Add-on-Pull, Core-
-            # Reboot). Wir warten NICHT — sonst blockiert ein Command den ganzen
-            # Batch und den naechsten Poll-Tick. Abschluss kommt via State-Push.
+            # blocking=True: nur so wirft ein fehlgeschlagenes update.install auch bei
+            # uns — mit blocking=False blieb der Fehlschlag in HA und der Command in der
+            # App bis zum serverseitigen Timeout auf „laeuft". Den Poll-Tick haelt das
+            # nicht auf, wir laufen bereits im Hintergrund-Task (s. handle()).
             await self._hass.services.async_call(
-                "update", "install", service_data, blocking=False
+                "update", "install", service_data, blocking=True
             )
+        except asyncio.CancelledError:
+            # HA faehrt herunter — bei Core/OS-Updates der Normalfall, genau darauf
+            # zielt das Update ja ab. Kein Fehlschlag: den Abschluss klaert der
+            # State-Push nach dem Neustart.
+            _LOGGER.debug(
+                "update.install fuer %s abgebrochen (HA-Neustart?) — kein Fehlerreport",
+                entity_id,
+            )
+            raise
         except Exception as err:  # noqa: BLE001 — ein Command-Fehler darf die Kette nicht stoppen
             _LOGGER.warning(
                 "update.install fuer %s fehlgeschlagen: %s", entity_id, err
@@ -103,10 +134,9 @@ class UpdateCommandHandler:
             await self._report(command_id, REPORT_FAILED, str(err))
             return
 
-        _LOGGER.info(
-            "update.install ausgeloest fuer %s (command=%s)", entity_id, command_id
+        _LOGGER.debug(
+            "update.install fuer %s zurueckgekehrt (command=%s)", entity_id, command_id
         )
-        await self._report(command_id, REPORT_STARTED)
 
     async def _report(
         self, command_id: str, status: str, error: str | None = None
