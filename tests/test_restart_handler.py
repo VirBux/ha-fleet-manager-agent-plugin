@@ -32,9 +32,17 @@ class FakeServices:
             raise RuntimeError("homeassistant.restart failed")
 
 
+class FakeConfig:
+    """hass.config-Stub — nur `components` wird gebraucht (Supervisor-Erkennung, #144)."""
+
+    def __init__(self, supervisor: bool = True):
+        self.components = {"homeassistant"} | ({"hassio"} if supervisor else set())
+
+
 class FakeHass:
-    def __init__(self, fail: bool = False):
+    def __init__(self, fail: bool = False, supervisor: bool = True):
         self.services = FakeServices(fail)
+        self.config = FakeConfig(supervisor)
 
 
 class _FakeResponse:
@@ -121,8 +129,79 @@ async def test_fehlgeschlagene_quittung_stoppt_den_neustart_nicht():
 
 @pytest.mark.asyncio
 async def test_handle_toleriert_leere_data():
-    """Die Aktion traegt keine Nutzdaten — ein leeres dict genuegt."""
+    """Ohne Umfang gilt `core` — ein leeres dict genuegt."""
     hass = FakeHass()
     await _handler(hass, FakeSession()).handle({})
 
     assert hass.services.calls[0]["service"] == "restart"
+
+
+@pytest.mark.asyncio
+async def test_scope_host_ruft_den_geraete_neustart():
+    """scope=host startet das ganze Geraet ueber den Supervisor (#144)."""
+    hass = FakeHass()
+    await _handler(hass, FakeSession()).handle({"action": "restart", "scope": "host"})
+
+    call = hass.services.calls[0]
+    assert call["domain"] == "hassio"
+    assert call["service"] == "host_reboot"
+    assert call["blocking"] is False
+
+
+@pytest.mark.asyncio
+async def test_scope_host_ohne_supervisor_meldet_failed_ohne_service_call():
+    """Ohne Supervisor gibt es kein hassio.host_reboot — sofort mit Ursache scheitern."""
+    hass = FakeHass(supervisor=False)
+    session = FakeSession()
+    await _handler(hass, session).handle({"action": "restart", "scope": "host"})
+
+    assert hass.services.calls == []
+    assert [p["json"]["status"] for p in session.posts] == [ACK_FAILED]
+    assert "Supervisor" in session.posts[0]["json"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_scope_supervisor_ruft_supervisor_restart_blockierend():
+    """scope=supervisor startet nur die Verwaltungsschicht — der Agent ueberlebt (#144)."""
+    hass = FakeHass()
+    session = FakeSession()
+    await _handler(hass, session).handle({"action": "restart", "scope": "supervisor"})
+
+    call = hass.services.calls[0]
+    assert call["domain"] == "hassio"
+    assert call["service"] == "supervisor_restart"
+    # blocking=True: ein Supervisor-Fehler soll hier ankommen, nicht still durchgehen.
+    assert call["blocking"] is True
+    # Quittung erst NACH dem Aufruf — hier gibt es keinen Prozess, der vorher endet.
+    assert [p["json"]["status"] for p in session.posts] == [ACK_RESTARTING]
+
+
+@pytest.mark.asyncio
+async def test_scope_supervisor_meldet_fehler_ohne_falsche_erfolgsquittung():
+    """Scheitert der Aufruf, geht `failed` raus — und eben kein `restarting`."""
+    hass = FakeHass(fail=True)
+    session = FakeSession()
+    await _handler(hass, session).handle({"action": "restart", "scope": "supervisor"})
+
+    assert [p["json"]["status"] for p in session.posts] == [ACK_FAILED]
+
+
+@pytest.mark.asyncio
+async def test_scope_supervisor_ohne_supervisor_meldet_failed():
+    """Ohne Supervisor gibt es auch hassio.supervisor_restart nicht."""
+    hass = FakeHass(supervisor=False)
+    session = FakeSession()
+    await _handler(hass, session).handle({"action": "restart", "scope": "supervisor"})
+
+    assert hass.services.calls == []
+    assert [p["json"]["status"] for p in session.posts] == [ACK_FAILED]
+    assert "supervisor_restart" in session.posts[0]["json"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_unbekannter_scope_faellt_auf_core_zurueck():
+    """Ein unbekannter Umfang darf nie den groesseren Eingriff ausloesen."""
+    hass = FakeHass()
+    await _handler(hass, FakeSession()).handle({"action": "restart", "scope": "alles"})
+
+    assert hass.services.calls[0]["domain"] == "homeassistant"

@@ -6,6 +6,12 @@ Command ein nicht-blockierender ``update.install``-Service-Call, danach sofort e
 Report ans Backend (``started`` | ``failed``). Ein Fehler pro Command bricht die
 Kette **nicht** ab — die restlichen Commands laufen weiter.
 
+Die Auslieferung ist **at-least-once**: geht die Quittierung verloren, stellt der
+serverseitige Watchdog den Command nach 5 Minuten zurueck auf ``PENDING`` und der
+naechste Poll liefert ihn erneut. Die Gegenseite dazu ist der Idempotenz-Riegel in
+diesem Handler (:attr:`UpdateCommandHandler._executed`): ein bereits ausgefuehrter
+``commandId`` wird nur noch quittiert, nicht ein zweites Mal installiert.
+
 Den **Abschluss** erkennt das Backend am naechsten 60-s-State-Push, sobald die
 Ziel-``update``-Entity ihr Ziel meldet. Ein **Fehlschlag** dagegen wird hier gemeldet:
 Der Batch laeuft in einem eigenen Hintergrund-Task, darin jeder ``update.install`` mit
@@ -20,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -34,6 +41,19 @@ REPORT_FAILED = "failed"
 
 # Fehlertext im Report defensiv kuerzen (Backend-Spalte + Log nicht aufblaehen).
 MAX_ERROR_LEN = 500
+
+# Quittierung wiederholen (#142, B7): ein einzelner verlorener POST liess den Command
+# im Backend auf DISPATCHED stehen — der Watchdog lieferte ihn danach erneut aus. Drei
+# Versuche mit kurzem Backoff, Gesamtbudget rund 30 s (3 x 8 s Timeout + 2 s + 4 s Pause).
+REPORT_TIMEOUT_SECONDS = 8
+REPORT_BACKOFF_SECONDS = (2, 4)
+
+# Lebensdauer des Idempotenz-Riegels (#142, B3). Muss ueber der Watchdog-Schwelle des
+# Backends (5 min) liegen, damit ein re-dispatchter Command sicher noch als „schon
+# ausgefuehrt" erkannt wird. Der Riegel lebt nur im Speicher: ein HA-Neustart leert ihn —
+# das ist hingenommen, denn nach einem Neustart ist eine erneute Installation kein
+# ueberlappender Doppelvorgang mehr.
+EXECUTED_TTL_SECONDS = 15 * 60
 
 
 class UpdateCommandHandler:
@@ -50,6 +70,8 @@ class UpdateCommandHandler:
         self._session = session
         self._backend_url = backend_url.rstrip("/")
         self._api_key = api_key
+        # Idempotenz-Riegel (#142, B3): commandId -> monotone Zeit der Ausfuehrung.
+        self._executed: dict[str, float] = {}
 
     async def handle(self, data: dict[str, Any]) -> None:
         """Poll-Handler fuer ``action == "update_batch"``.
@@ -103,6 +125,27 @@ class UpdateCommandHandler:
         if cmd.get("backup"):
             service_data["backup"] = True
 
+        # Idempotenz-Riegel (#142, B3): Die Auslieferung ist at-least-once. Ging die
+        # Quittierung verloren, stellt der Watchdog den Command nach 5 min auf PENDING
+        # zurueck und der naechste Poll bringt ihn erneut — frueher lief update.install
+        # dann ein zweites Mal. Systematisch traf das „Alle updaten": der Batch arbeitet
+        # sequenziell mit blocking=True, und ein Add-on, das minutenlang ein Image zieht,
+        # schiebt die Quittierung aller nachfolgenden Commands ueber die Schwelle.
+        # Jetzt wird ein bekannter Command nur noch quittiert.
+        self._forget_expired()
+        if command_id in self._executed:
+            _LOGGER.info(
+                "Command %s wurde bereits ausgefuehrt — nur quittieren, kein zweites "
+                "update.install fuer %s",
+                command_id,
+                entity_id,
+            )
+            await self._report(command_id, REPORT_STARTED)
+            return
+        # VOR dem Service-Call vermerken: ein waehrend der Installation erneut
+        # ausgelieferter Command darf ebenso wenig ein zweites Mal starten.
+        self._executed[command_id] = time.monotonic()
+
         # „started" sofort, bevor der Call laeuft: die App soll den Zustand direkt
         # zeigen, nicht erst nach Minuten. Ein spaeterer Fehlschlag korrigiert ihn.
         _LOGGER.info(
@@ -138,37 +181,84 @@ class UpdateCommandHandler:
             "update.install fuer %s zurueckgekehrt (command=%s)", entity_id, command_id
         )
 
+    def _forget_expired(self) -> None:
+        """Raeumt abgelaufene Eintraege des Idempotenz-Riegels.
+
+        Ohne das Aufraeumen waere die Merkliste ein langsames Speicherleck — sie
+        braucht nur so lange zu tragen, wie das Backend re-dispatchen kann.
+        """
+        cutoff = time.monotonic() - EXECUTED_TTL_SECONDS
+        for command_id in [k for k, at in self._executed.items() if at < cutoff]:
+            del self._executed[command_id]
+
     async def _report(
         self, command_id: str, status: str, error: str | None = None
     ) -> None:
         """Quittiert einen Command ans Backend (``POST .../report``).
 
-        Serverseitig idempotent. Ein fehlgeschlagener Report wird nur geloggt —
-        notfalls schliesst der naechste State-Push den Command ueber den
-        Versionsstand bzw. der Watchdog re-queued ihn.
+        Serverseitig idempotent, darum ist ein Wiederholungsversuch gefahrlos — und
+        noetig: frueher wurde ein verlorener POST nur geloggt, der Command blieb im
+        Backend auf ``DISPATCHED`` und wurde nach der Watchdog-Schwelle erneut
+        ausgeliefert. Drei Versuche mit kurzem Backoff (#142, B7).
+
+        Wiederholt wird nur, was sich wiederholen laesst: Netzwerkfehler, Timeouts und
+        5xx. Ein 4xx ist eine Aussage des Backends (z.B. Command unbekannt) — die
+        aendert sich beim zweiten Anlauf nicht. Bleibt auch der letzte Versuch erfolglos,
+        traegt weiterhin die Selbstheilung: der naechste State-Push schliesst den Command
+        ueber den Versionsstand ab, und der Riegel oben verhindert die Doppelausfuehrung.
         """
         url = f"{self._backend_url}/api/agent/update-commands/{command_id}/report"
         body: dict[str, Any] = {"status": status}
         if error:
             body["error"] = error[:MAX_ERROR_LEN]
         headers = {"X-API-Key": self._api_key, "Content-Type": "application/json"}
-        timeout = aiohttp.ClientTimeout(total=10)
-        try:
-            async with self._session.post(
-                url, json=body, headers=headers, timeout=timeout
-            ) as resp:
-                if 200 <= resp.status < 300:
-                    _LOGGER.debug(
-                        "Command %s quittiert (status=%s, HTTP %d)",
-                        command_id,
-                        status,
-                        resp.status,
-                    )
-                else:
+        timeout = aiohttp.ClientTimeout(total=REPORT_TIMEOUT_SECONDS)
+        attempts = len(REPORT_BACKOFF_SECONDS) + 1
+
+        for attempt in range(attempts):
+            try:
+                async with self._session.post(
+                    url, json=body, headers=headers, timeout=timeout
+                ) as resp:
+                    if 200 <= resp.status < 300:
+                        _LOGGER.debug(
+                            "Command %s quittiert (status=%s, HTTP %d)",
+                            command_id,
+                            status,
+                            resp.status,
+                        )
+                        return
+                    if resp.status < 500:
+                        _LOGGER.warning(
+                            "Command-Report %s abgelehnt (HTTP %d) — kein erneuter Versuch",
+                            command_id,
+                            resp.status,
+                        )
+                        return
                     _LOGGER.warning(
-                        "Command-Report %s fehlgeschlagen (HTTP %d)",
+                        "Command-Report %s fehlgeschlagen (HTTP %d, Versuch %d/%d)",
                         command_id,
                         resp.status,
+                        attempt + 1,
+                        attempts,
                     )
-        except Exception as err:  # noqa: BLE001 — Report-Fehler dürfen nichts crashen
-            _LOGGER.warning("Command-Report %s Netzwerkfehler: %s", command_id, err)
+            except asyncio.CancelledError:
+                # HA faehrt herunter — nicht in eine Retry-Schleife zwingen.
+                raise
+            except Exception as err:  # noqa: BLE001 — Report-Fehler dürfen nichts crashen
+                _LOGGER.warning(
+                    "Command-Report %s Netzwerkfehler (Versuch %d/%d): %s",
+                    command_id,
+                    attempt + 1,
+                    attempts,
+                    err,
+                )
+            if attempt < len(REPORT_BACKOFF_SECONDS):
+                await asyncio.sleep(REPORT_BACKOFF_SECONDS[attempt])
+
+        _LOGGER.warning(
+            "Command-Report %s nach %d Versuchen aufgegeben (status=%s)",
+            command_id,
+            attempts,
+            status,
+        )

@@ -7,7 +7,20 @@ from typing import Any
 
 import pytest
 
+from ha_fleet_agent import update_handler as update_handler_module
 from ha_fleet_agent.update_handler import UpdateCommandHandler
+
+
+@pytest.fixture(autouse=True)
+def _kein_report_backoff(monkeypatch):
+    """Backoff der Report-Wiederholung (#142) im Test auf 0 setzen.
+
+    Die Anzahl der Versuche bleibt unveraendert — nur die Pausen dazwischen fallen weg,
+    sonst kostete jeder Netzwerkfehler-Test die echten 6 Sekunden Wartezeit.
+    """
+    monkeypatch.setattr(
+        update_handler_module, "REPORT_BACKOFF_SECONDS", (0, 0), raising=True
+    )
 
 
 # --------------------------------------------------------- Stubs
@@ -254,7 +267,12 @@ async def test_report_netzwerkfehler_kein_crash():
     """Ein fehlschlagender Report-POST darf den Handler nicht crashen."""
 
     class _BoomSession:
+        def __init__(self):
+            self.attempts = 0
+
         def post(self, *a: Any, **kw: Any):
+            self.attempts += 1
+
             class _Ctx:
                 async def __aenter__(self):
                     raise RuntimeError("net down")
@@ -265,13 +283,16 @@ async def test_report_netzwerkfehler_kein_crash():
             return _Ctx()
 
     hass = FakeHass()
+    session = _BoomSession()
     handler = UpdateCommandHandler(
-        hass, _BoomSession(), "https://api.ha-fleet-manager.com", "key"
+        hass, session, "https://api.ha-fleet-manager.com", "key"
     )
     await _run(handler, hass, 
         {"commands": [{"commandId": "c1", "entity_id": "update.x"}]}
     )
     assert len(hass.services.calls) == 1  # Install lief, Report-Fehler abgefangen
+    # Drei Versuche (#142, B7) — danach traegt die Selbstheilung ueber den State-Push.
+    assert session.attempts == 3
 
 
 @pytest.mark.asyncio
@@ -311,3 +332,90 @@ async def test_abbruch_beim_ha_neustart_meldet_keinen_fehlschlag():
         )
 
     assert [p["json"]["status"] for p in session.posts] == ["started"]
+
+
+# --------------------------------------------------------- #142: Retry + Idempotenz
+
+
+@pytest.mark.asyncio
+async def test_report_wird_nach_5xx_wiederholt_und_gibt_bei_erfolg_auf():
+    """Ein 503 ist voruebergehend — der zweite Versuch quittiert, danach ist Schluss."""
+
+    class _FlakySession:
+        def __init__(self):
+            self.posts: list[dict] = []
+
+        def post(self, url, json=None, headers=None, timeout=None):  # noqa: ANN001
+            self.posts.append({"url": url, "json": json})
+            # Erster Versuch 503, danach 204.
+            return _FakeResponse(503 if len(self.posts) == 1 else 204)
+
+    hass = FakeHass()
+    session = _FlakySession()
+    handler = UpdateCommandHandler(
+        hass, session, "https://api.ha-fleet-manager.com", "key"
+    )
+    await _run(handler, hass, {"commands": [{"commandId": "c1", "entity_id": "update.x"}]})
+
+    assert len(session.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_report_wird_bei_4xx_nicht_wiederholt():
+    """Ein 404 ist eine Aussage des Backends (Command unbekannt) — kein zweiter Anlauf."""
+    hass = FakeHass()
+    session = FakeSession(status=404)
+    await _run(_handler(hass, session), hass, {"commands": [{"commandId": "c1", "entity_id": "update.x"}]})
+
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_erneut_ausgelieferter_command_installiert_nicht_zweimal():
+    """Idempotenz-Riegel (#142, B3): Nach einem verlorenen Report liefert der Watchdog
+    denselben Command erneut aus — er wird dann nur quittiert, nicht neu installiert."""
+    hass = FakeHass()
+    session = FakeSession()
+    handler = _handler(hass, session)
+    batch = {"commands": [{"commandId": "c1", "entity_id": "update.x"}]}
+
+    await _run(handler, hass, batch)
+    hass.tasks.clear()
+    await _run(handler, hass, batch)
+
+    assert len(hass.services.calls) == 1  # genau ein update.install
+    assert [p["json"]["status"] for p in session.posts] == ["started", "started"]
+
+
+@pytest.mark.asyncio
+async def test_riegel_gilt_je_command_nicht_je_entity():
+    """Ein neuer Befehl fuer dieselbe Entity muss laufen — der Riegel merkt sich
+    commandIds, nicht Entities (sonst liesse sich ein Update nie wiederholen)."""
+    hass = FakeHass()
+    session = FakeSession()
+    handler = _handler(hass, session)
+
+    await _run(handler, hass, {"commands": [{"commandId": "c1", "entity_id": "update.x"}]})
+    hass.tasks.clear()
+    await _run(handler, hass, {"commands": [{"commandId": "c2", "entity_id": "update.x"}]})
+
+    assert len(hass.services.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_riegel_verfaellt_nach_ttl():
+    """Der Riegel traegt nur ueber das Re-Dispatch-Fenster hinaus — danach wird
+    aufgeraeumt, damit die Merkliste nicht unbegrenzt waechst."""
+    hass = FakeHass()
+    session = FakeSession()
+    handler = _handler(hass, session)
+
+    await _run(handler, hass, {"commands": [{"commandId": "c1", "entity_id": "update.x"}]})
+    assert "c1" in handler._executed
+    # Eintrag kuenstlich altern lassen (aelter als EXECUTED_TTL_SECONDS).
+    handler._executed["c1"] -= update_handler_module.EXECUTED_TTL_SECONDS + 1
+    hass.tasks.clear()
+
+    await _run(handler, hass, {"commands": [{"commandId": "c1", "entity_id": "update.x"}]})
+
+    assert len(hass.services.calls) == 2

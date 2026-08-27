@@ -104,6 +104,10 @@ class StateReporter:
         self._endpoint = backend_url.rstrip("/") + "/api/agent/state"
         self._api_key = api_key
         self._started_at = time.monotonic()
+        # Startzeitpunkt von Home Assistant selbst (#142, B5) — einmal ermittelt, dann
+        # gecacht: der Prozess-Start aendert sich zur Laufzeit nicht.
+        self._ha_started_at: str | None = None
+        self._ha_started_at_checked = False
         self._unsub_interval = None
         # Virtualisierungserkennung (#137): einmal ermitteln, dann cachen — die
         # Hardware wechselt zur Laufzeit nicht.
@@ -227,6 +231,9 @@ class StateReporter:
         payload["uptime_seconds"] = self._safe(
             lambda: int(time.monotonic() - self._started_at)
         )
+        # ha_started_at (#142, B5): der Startzeitpunkt von Home Assistant selbst. Das
+        # Backend bevorzugt ihn gegenueber uptime_seconds — s. _collect_ha_started_at().
+        payload["ha_started_at"] = self._safe(self._collect_ha_started_at)
         payload["entities_count"] = self._safe(
             lambda: len(self._hass.states.async_all())
         )
@@ -651,6 +658,38 @@ class StateReporter:
         return round(value, 1)
 
     # --------------------------------------------------------- Helper
+
+    def _collect_ha_started_at(self) -> str | None:
+        """Startzeitpunkt von **Home Assistant selbst** als ISO-8601-UTC (#142, B5).
+
+        ``uptime_seconds`` misst in Wahrheit die Laufzeit *dieses Plugins* seit dem Setup
+        seiner Config-Entry (``time.monotonic() - self._started_at``). Ein blosser Reload
+        der Integration — Optionsaenderung, HACS-Vorgang, erneutes Setup — setzt den
+        Zaehler zurueck. Dem Backend sah das aus wie ein frisch gestarteter Home
+        Assistant, und es zog daraus zwei falsche Schluesse: der fern ausgeloeste
+        Neustart (#127) galt als bestaetigt, und ein noch offener Update-Befehl als
+        „Neustart war, Update kam trotzdem nicht an".
+
+        Quelle ist darum die Startzeit des **HA-Core-Prozesses** (``psutil``, ohnehin eine
+        Pflicht-Dependency von HA Core und hier schon fuer CPU/RAM genutzt). Sie ueberlebt
+        jeden Integrations-Reload und wechselt genau dann, wenn Home Assistant wirklich neu
+        startet. Faellt psutil aus, bleibt das Feld ``None`` — das Backend faellt dann auf
+        ``uptime_seconds`` zurueck.
+        """
+        if self._ha_started_at_checked:
+            return self._ha_started_at
+        self._ha_started_at_checked = True
+        try:
+            import psutil  # noqa: PLC0415 — Lazy-Import wie bei den Host-Stats
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("psutil nicht importierbar — kein ha_started_at")
+            return None
+        created = psutil.Process(os.getpid()).create_time()
+        self._ha_started_at = (
+            dt_util.utc_from_timestamp(created).isoformat().replace("+00:00", "Z")
+        )
+        _LOGGER.debug("HA-Startzeitpunkt ermittelt: %s", self._ha_started_at)
+        return self._ha_started_at
 
     @staticmethod
     def _safe(fn: Any) -> Any:
