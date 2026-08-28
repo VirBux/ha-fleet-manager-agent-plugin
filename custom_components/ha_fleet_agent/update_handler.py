@@ -55,6 +55,20 @@ REPORT_BACKOFF_SECONDS = (2, 4)
 # ueberlappender Doppelvorgang mehr.
 EXECUTED_TTL_SECONDS = 15 * 60
 
+# Attribute einer ``update``-Entity, aus denen das Versionsformat des Anbieters
+# abgelesen wird (#146). Reihenfolge = Vorrang: die installierte Version ist die
+# verlaesslichste Referenz, ``latest_version`` springt ein, wenn sie fehlt.
+VERSION_REFERENCE_ATTRIBUTES = ("installed_version", "latest_version")
+
+
+def _has_v_prefix(version: str) -> bool:
+    """``True`` fuer Versionen der Form ``v1.2.3`` — Praefix ``v`` vor einer Ziffer.
+
+    Bewusst eng: nur ein ``v`` unmittelbar vor einer Ziffer gilt als Praefix, damit
+    Versionsnamen, die zufaellig mit ``v`` beginnen (``vintage-2``), unangetastet bleiben.
+    """
+    return len(version) > 1 and version[0] == "v" and version[1].isdigit()
+
 
 class UpdateCommandHandler:
     """Verarbeitet die ``update_batch``-Poll-Aktion (#103)."""
@@ -121,7 +135,7 @@ class UpdateCommandHandler:
         service_data: dict[str, Any] = {"entity_id": entity_id}
         version = cmd.get("version")
         if version:
-            service_data["version"] = version
+            service_data["version"] = self._align_version(entity_id, str(version))
         if cmd.get("backup"):
             service_data["backup"] = True
 
@@ -180,6 +194,48 @@ class UpdateCommandHandler:
         _LOGGER.debug(
             "update.install fuer %s zurueckgekehrt (command=%s)", entity_id, command_id
         )
+
+    def _align_version(self, entity_id: str, version: str) -> str:
+        """Gleicht die Zielversion an das Versionsformat der Ziel-Entity an (#146).
+
+        **Warum:** Das Backend fuehrt Versionen normalisiert, also ohne fuehrendes
+        ``v`` (``1.10.0``). HACS dagegen fuehrt seine Versionen als **Tag-Namen** —
+        bei uns ``v1.10.0``. Und HACS baut aus der uebergebenen Version direkt eine
+        Git-Ref: ``raw.githubusercontent.com/<repo>/<version>/hacs.json``. Ohne das
+        ``v`` gibt es diesen Ref nicht, HACS bekommt einen 404 und bricht mit
+        „The version 1.10.0 for this integration can not be used with HACS." ab —
+        jedes gezielte Plugin-Update schlug damit fehl, unabhaengig von der Version.
+
+        Angeglichen wird ausschliesslich das ``v``-Praefix, und nur wenn die Entity
+        selbst eine Referenz liefert: fuehrt sie ihre Versionen mit ``v``, bekommt die
+        Zielversion eines; fuehrt sie sie ohne, faellt eins weg. Core, Supervisor, OS
+        und Add-ons melden ohne Praefix — dort bleibt alles unveraendert. Fehlt die
+        Entity oder taugt keine Referenz, geht die Version unveraendert raus (die
+        bisherige Vorgehensweise).
+        """
+        state = self._hass.states.get(entity_id)
+        if state is None:
+            return version
+
+        for attribute in VERSION_REFERENCE_ATTRIBUTES:
+            reference = state.attributes.get(attribute)
+            if not isinstance(reference, str) or not reference:
+                continue
+            reference_prefixed = _has_v_prefix(reference)
+            if reference_prefixed == _has_v_prefix(version):
+                return version  # Format passt bereits
+            aligned = f"v{version}" if reference_prefixed else version[1:]
+            _LOGGER.debug(
+                "Zielversion %s an das Format von %s angeglichen (%s=%s) -> %s",
+                version,
+                entity_id,
+                attribute,
+                reference,
+                aligned,
+            )
+            return aligned
+
+        return version
 
     def _forget_expired(self) -> None:
         """Raeumt abgelaufene Eintraege des Idempotenz-Riegels.

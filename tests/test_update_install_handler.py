@@ -49,12 +49,34 @@ class FakeServices:
             raise RuntimeError(f"install failed for {entity_id}")
 
 
+class FakeState:
+    """State-Stub — traegt nur die Attribute, die der Handler liest."""
+
+    def __init__(self, **attributes: Any):
+        self.attributes = attributes
+
+
+class FakeStates:
+    """hass.states-Stub: liefert die vorbereiteten States, sonst None."""
+
+    def __init__(self, states: dict[str, FakeState] | None = None):
+        self._states = states or {}
+
+    def get(self, entity_id: str) -> FakeState | None:
+        return self._states.get(entity_id)
+
+
 class FakeHass:
     """hass-Stub. ``async_create_task`` fuehrt den Batch als echten Task aus — der
     Handler kehrt sofort zurueck, die Tests warten ueber :meth:`settle` auf ihn."""
 
-    def __init__(self, fail_for: set[str] | None = None):
+    def __init__(
+        self,
+        fail_for: set[str] | None = None,
+        states: dict[str, FakeState] | None = None,
+    ):
         self.services = FakeServices(fail_for)
+        self.states = FakeStates(states)
         self.tasks: list[asyncio.Task] = []
 
     def async_create_task(self, coro, name: str | None = None):  # noqa: ANN001
@@ -419,3 +441,91 @@ async def test_riegel_verfaellt_nach_ttl():
     await _run(handler, hass, {"commands": [{"commandId": "c1", "entity_id": "update.x"}]})
 
     assert len(hass.services.calls) == 2
+
+
+# --------------------------------------------------------- Versionsformat (#146)
+
+
+@pytest.mark.asyncio
+async def test_version_bekommt_v_praefix_wenn_die_entity_es_fuehrt():
+    """HACS fuehrt Tag-Namen (``v1.10.0``) — die Zielversion wird angeglichen.
+
+    Ohne das Praefix baut HACS die Ref ``…/1.10.0/hacs.json``, bekommt einen 404 und
+    lehnt mit „can not be used with HACS" ab. Genau daran scheiterte jedes gezielte
+    Plugin-Update.
+    """
+    hass = FakeHass(
+        states={
+            "update.ha_fleet_manager_agent_update": FakeState(
+                installed_version="v1.8.2", latest_version="v1.10.0"
+            )
+        }
+    )
+    session = FakeSession()
+    await _run(_handler(hass, session), hass,
+        {
+            "commands": [
+                {
+                    "commandId": "c1",
+                    "entity_id": "update.ha_fleet_manager_agent_update",
+                    "version": "1.10.0",
+                }
+            ]
+        }
+    )
+
+    assert hass.services.calls[0]["data"]["version"] == "v1.10.0"
+
+
+@pytest.mark.asyncio
+async def test_version_verliert_v_praefix_wenn_die_entity_ohne_fuehrt():
+    """Umgekehrter Fall: Entity ohne Praefix → das ``v`` faellt weg."""
+    hass = FakeHass(
+        states={"update.x": FakeState(installed_version="2026.5.3")}
+    )
+    session = FakeSession()
+    await _run(_handler(hass, session), hass,
+        {"commands": [{"commandId": "c1", "entity_id": "update.x", "version": "v2026.5.4"}]}
+    )
+
+    assert hass.services.calls[0]["data"]["version"] == "2026.5.4"
+
+
+@pytest.mark.asyncio
+async def test_version_bleibt_wenn_das_format_schon_passt():
+    """Core/OS/Add-ons melden ohne Praefix — dort darf nichts angefasst werden."""
+    hass = FakeHass(
+        states={"update.core": FakeState(installed_version="2026.5.3")}
+    )
+    session = FakeSession()
+    await _run(_handler(hass, session), hass,
+        {"commands": [{"commandId": "c1", "entity_id": "update.core", "version": "2026.5.4"}]}
+    )
+
+    assert hass.services.calls[0]["data"]["version"] == "2026.5.4"
+
+
+@pytest.mark.asyncio
+async def test_latest_version_springt_ein_wenn_installed_version_fehlt():
+    """Ist die installierte Version unbekannt, traegt ``latest_version`` die Referenz."""
+    hass = FakeHass(
+        states={"update.agent": FakeState(installed_version=None, latest_version="v1.10.0")}
+    )
+    session = FakeSession()
+    await _run(_handler(hass, session), hass,
+        {"commands": [{"commandId": "c1", "entity_id": "update.agent", "version": "1.9.0"}]}
+    )
+
+    assert hass.services.calls[0]["data"]["version"] == "v1.9.0"
+
+
+@pytest.mark.asyncio
+async def test_ohne_entity_bleibt_die_version_unveraendert():
+    """Kein State (Entity noch nicht geladen) → keine Vermutung, Version geht roh raus."""
+    hass = FakeHass()
+    session = FakeSession()
+    await _run(_handler(hass, session), hass,
+        {"commands": [{"commandId": "c1", "entity_id": "update.unbekannt", "version": "1.10.0"}]}
+    )
+
+    assert hass.services.calls[0]["data"]["version"] == "1.10.0"
