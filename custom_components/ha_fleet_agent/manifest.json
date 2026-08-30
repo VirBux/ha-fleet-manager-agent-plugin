@@ -1,6 +1,7 @@
 {
   "domain": "ha_fleet_agent",
   "name": "HA Fleet Manager Agent",
+  "after_dependencies": ["recorder"],
   "codeowners": [
     "@VirBux"
   ],
