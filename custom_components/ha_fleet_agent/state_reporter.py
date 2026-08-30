@@ -57,6 +57,7 @@ from .const import (
     VIRTUALIZATION_HYPERVISOR_FILE,
     WARNING_LOG_LEVELS,
 )
+from .health import HealthMonitor
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -113,6 +114,10 @@ class StateReporter:
         # Hardware wechselt zur Laufzeit nicht.
         self._virtualization: str | None = None
         self._virtualization_checked = False
+        # Systemgesundheit je Bestandteil (#147). Haengt bewusst am Reporter und
+        # nicht an einer eigenen Config-Entry-Komponente: die Ergebnisse reisen im
+        # bestehenden 60-s-Payload mit, also teilen sich beide auch den Lebenszyklus.
+        self._health = HealthMonitor(hass, session)
 
     def start(self) -> None:
         """Sofort einen Payload senden und das Intervall registrieren."""
@@ -121,11 +126,13 @@ class StateReporter:
             self._tick,
             datetime.timedelta(seconds=STATE_UPDATE_INTERVAL_SECONDS),
         )
+        self._health.start()
         # Erstes Payload sofort — nicht erst nach 60 s warten
         self._hass.async_create_task(self._push_once())
 
     def stop(self) -> None:
         """Stoppt den periodischen Timer."""
+        self._health.stop()
         if self._unsub_interval is not None:
             self._unsub_interval()
             self._unsub_interval = None
@@ -291,9 +298,18 @@ class StateReporter:
         # Liest direkt hass.states, braucht also keine Supervisor-Info.
         payload["updates"] = self._safe(self._list_updates) or []
 
+        # Systemgesundheit je Bestandteil (#147). Verdichtete Zahlen plus je
+        # Bestandteil ein Kurzstatus — keine Rohdaten, keine zusaetzlichen
+        # Requests: die teureren Pruefungen laufen im eigenen 10-Minuten-Takt des
+        # HealthMonitors, hier wird nur ihr letztes Ergebnis eingesammelt. Die
+        # Add-on-Liste wird durchgereicht, statt die Supervisor-Info erneut zu holen.
+        payload["health"] = self._safe(
+            lambda: self._health.collect(payload.get("addons"))
+        )
+
         # Diagnose-Log: ohne PII, Quelle pro Feld — hilft beim Bug-Triaging.
         _LOGGER.debug(
-            "State-Payload aufgebaut — ha_version=%s cpu=%s(%s) ram=%s(%s) disk=%s temp=%s(%s,%s) ip=%s addons=%d updates=%d",
+            "State-Payload aufgebaut — ha_version=%s cpu=%s(%s) ram=%s(%s) disk=%s temp=%s(%s,%s) ip=%s addons=%d updates=%d loop_lag=%sms unavailable=%s%% health=%s",
             payload.get("ha_version"),
             payload.get("cpu_percent"),
             cpu_source,
@@ -306,6 +322,12 @@ class StateReporter:
             payload.get("ip"),
             len(payload.get("addons", [])),
             len(payload.get("updates", [])),
+            (payload.get("health") or {}).get("loop_lag_ms"),
+            (payload.get("health") or {}).get("unavailable_ratio"),
+            sorted(
+                f"{name}={entry.get('status')}"
+                for name, entry in ((payload.get("health") or {}).get("components") or {}).items()
+            ),
         )
 
         return payload

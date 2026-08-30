@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -260,3 +260,197 @@ STATUS_SESSION_ACTIVE = "session_active"
 
 # Repair-Issue-IDs (eingehende Verbindungsanfragen — REQUIREMENTS §4.2)
 ISSUE_ID_PREFIX = "connection_request_"
+
+# ---------------------------------------------------------------------------
+# Systemgesundheit je HA-Bestandteil (#147, Etappe 1)
+# ---------------------------------------------------------------------------
+# Home Assistant ist kein einzelner Prozess. Der 60-s-Push beweist bisher nur,
+# dass der Agent atmet — nicht, ob Kern, Oberfläche, Datenbank, Supervisor,
+# Add-ons und Integrationen untereinander noch funktionieren. Die folgenden
+# Konstanten steuern die *billige Innensicht*: alles läuft lokal, ohne neue
+# Verbindungen nach außen, und die Ergebnisse reisen als verdichtete Felder im
+# bestehenden State-Payload mit.
+
+# Takt der Event-Loop-Lag-Messung. Bewusst 10 s statt 1 s: die Aussage ist
+# dieselbe, die Zahl der Wakeups ein Zehntel. Gemessen wird die Abweichung
+# zwischen geplanter und tatsächlicher Schlafdauer — hängt der Loop, wacht der
+# Task zu spät auf, und genau diese Differenz ist das Signal.
+HEALTH_LOOP_LAG_INTERVAL_SECONDS = 10
+
+# Schwellen für den Kern-Punkt in Millisekunden. Gemeldet wird das MAXIMUM seit
+# dem letzten Push, nicht der Mittelwert: ein einzelner Vier-Sekunden-Hänger
+# verschwindet im Mittel, ist aber genau das, was der Nutzer als "UI tot"
+# erlebt.
+#
+# Auf der Test-VM kalibriert (2026-08-29, HA 2026.6.2 in VirtualBox, im
+# Leerlauf): die Maxima je 60-Sekunden-Fenster lagen bei 329, 354, 401, 592,
+# 612, 808 und 911 ms, mit einem einzelnen Ausreißer von 3.262 ms. Die
+# ursprünglich geplanten 50 ms hätten diese völlig normal reagierende Instanz
+# dauerhaft gelb gefärbt — und eine Ampel, die immer leuchtet, schaut sich
+# niemand mehr an. Ein Maximum über sechs Messungen ist naturgemäß ein
+# Vielfaches des Medians, und virtualisierte Installationen (Proxmox, ESXi,
+# VirtualBox) sind bei Kunden der Normalfall, nicht die Ausnahme.
+#
+# 1 s als Warnschwelle lässt den beobachteten Leerlauf grün und fängt den
+# 3-Sekunden-Ausreißer als "verdient einen Blick" ein. 5 s als Fehlerschwelle
+# ist der Bereich, in dem ein Mensch die Oberfläche als hängend erlebt.
+# Zusätzlich entprellt das Backend (erst n aufeinanderfolgende Befunde kippen
+# die Ampel), ein einzelner Ausreißer schlägt also gar nicht erst durch.
+HEALTH_LOOP_LAG_WARN_MS = 1000.0
+HEALTH_LOOP_LAG_ERROR_MS = 5000.0
+
+# Takt der teureren (aber immer noch lokalen) Prüfungen: Frontend-Bundle,
+# Supervisor-Resolution, Recorder-Dateigroesse. 10 Minuten reichen — keine
+# dieser Größen kippt im Sekundentakt.
+HEALTH_SLOW_CHECK_INTERVAL_SECONDS = 600
+
+# --- Oberfläche -----------------------------------------------------------
+# Geprüft wird NICHT der Statuscode der Startseite. Eine tote Instanz liefert
+# das HTML-Dokument weiterhin mit 200, während die JS-Bundles fehlschlagen —
+# der Nutzer sieht ein Alt-Text-Gerippe, ein Statuscode-Check meldete "gesund".
+# Darum: HTML holen, den darin referenzierten Bundle-Pfad lesen und auf GENAU
+# diesen ein HEAD absetzen (kein Body-Download).
+#
+# Der Pfad wird gelesen, nicht geraten: HA 2026.6 liefert nur noch
+# `/frontend_latest/`, ältere Versionen kannten zusätzlich `/frontend_es5/`.
+# Das Muster deckt beide (und künftige) Ordnernamen ab, weil es den Ordner aus
+# dem HTML übernimmt statt ihn zu konstruieren.
+# Zwei Muster in Prioritaet: erst das core-Bundle (das Herzstueck, ohne das die
+# Oberflaeche gar nicht startet), sonst irgendein referenziertes Bundle. Der
+# Zeichenvorrat schliesst Grossbuchstaben ein: HA verwendet heute Lowercase-Hex,
+# ein kuenftiger Base62-Hash wuerde sonst stumm als "kein Bundle gefunden"
+# durchfallen und den Punkt grundlos gelb faerben.
+HEALTH_FRONTEND_BUNDLE_PATTERNS = (
+    r"""["'](/frontend_[A-Za-z0-9_]+/core\.[A-Za-z0-9_.-]+\.js)["']""",
+    r"""["'](/frontend_[A-Za-z0-9_]+/[A-Za-z0-9_.-]+\.js)["']""",
+)
+# Timeout je Request. Großzügig genug für eine träge Instanz, kurz genug,
+# dass der Check nicht in den nächsten 10-Minuten-Takt läuft.
+HEALTH_FRONTEND_TIMEOUT_SECONDS = 8
+# Ab dieser Dauer (Sekunden, HTML + HEAD zusammen) gilt die Auslieferung als
+# träge → gelb. Ueber Loopback ist alles über einer Sekunde auffällig; die
+# Test-VM liefert im Normalfall unter 20 ms.
+HEALTH_FRONTEND_SLOW_SECONDS = 1.5
+
+# --- Datenbank -------------------------------------------------------------
+# Standard-Dateiname der SQLite-Recorder-DB. Nur Fallback: primär wird die
+# `db_url` des Recorders gelesen (öffentlicher Helfer ``get_instance``), weil
+# nur sie SQLite von einer externen MariaDB/PostgreSQL unterscheidet.
+HEALTH_RECORDER_DEFAULT_DB_FILE = "home-assistant_v2.db"
+# Bei aktivem WAL-Modus liegt ein erheblicher Teil der Daten in der
+# -wal-Datei (auf der Test-VM 4,8 MB DB + 0,4 MB WAL). Beide zählen.
+HEALTH_RECORDER_DB_SUFFIXES = ("", "-wal")
+# Ab dieser Größe gilt die SQLite-DB als ungewöhnlich groß (gelb). SQLite
+# trägt HA-Historien problemlos bis in den einstelligen GB-Bereich; jenseits
+# davon werden Purge-Läufe und Statistik-Abfragen spürbar träge.
+HEALTH_RECORDER_DB_WARN_BYTES = 4 * 1024 * 1024 * 1024
+
+# --- Integrationen ---------------------------------------------------------
+# Anteil `unavailable`/`unknown` an allen Entities, ab dem der
+# Integrations-Punkt auf gelb geht. Springt die Quote sprunghaft, ist meist ein
+# Funk-Stick oder ein Add-on weg — lange bevor jemand anruft. Ein eigener Punkt
+# wäre es wert, überlädt aber die Karte (Spec), darum fällt die Quote hier ein.
+#
+# 40 % statt der zunächst erwogenen 30 %: die Test-VM liegt im Normalbetrieb bei
+# 26,3 % (verwaiste Demo-Entities, nicht erreichbare Geräte — auf gewachsenen
+# Installationen eher mehr als weniger). Bei 30 % wäre der Abstand zur
+# Basislast so klein, dass der Punkt bei jeder Schwankung flackert.
+HEALTH_UNAVAILABLE_RATIO_WARN = 40.0
+
+# --- Statuswerte -----------------------------------------------------------
+# Drei Zustände, absichtlich ohne Farbnamen: die Farbe ist Sache der Anzeige.
+# "Keine Aussage möglich" wird NICHT als vierter Wert gemeldet — der
+# betreffende Bestandteil fehlt dann schlicht im Payload (eine Container-
+# Installation hat weder Supervisor noch Add-ons, und ein dauerhaft grauer
+# Punkt suggerierte dort ein Problem, wo keins ist).
+HEALTH_STATUS_OK = "ok"
+HEALTH_STATUS_WARN = "warn"
+HEALTH_STATUS_ERROR = "error"
+
+# Bestandteile in Anzeige-Reihenfolge. Single Source of Truth für Plugin,
+# Backend-Vertrag und die Punktzeile im Frontend.
+HEALTH_COMPONENT_CORE = "core"
+HEALTH_COMPONENT_FRONTEND = "frontend"
+HEALTH_COMPONENT_DATABASE = "database"
+HEALTH_COMPONENT_SUPERVISOR = "supervisor"
+HEALTH_COMPONENT_ADDONS = "addons"
+HEALTH_COMPONENT_INTEGRATIONS = "integrations"
+HEALTH_COMPONENTS = (
+    HEALTH_COMPONENT_CORE,
+    HEALTH_COMPONENT_FRONTEND,
+    HEALTH_COMPONENT_DATABASE,
+    HEALTH_COMPONENT_SUPERVISOR,
+    HEALTH_COMPONENT_ADDONS,
+    HEALTH_COMPONENT_INTEGRATIONS,
+)
+
+# Gründe als stabile Codes statt fertiger Sätze — übersetzt wird in der
+# Web-App (fünf Sprachen), das Plugin liefert nur den Schlüssel plus ein
+# `detail` mit den konkret betroffenen Namen ("zwave_js, hue").
+HEALTH_REASON_LOOP_LAG = "loop_lag"
+HEALTH_REASON_FRONTEND_BUNDLE_MISSING = "frontend_bundle_missing"
+HEALTH_REASON_FRONTEND_UNREACHABLE = "frontend_unreachable"
+HEALTH_REASON_FRONTEND_NO_BUNDLE_REF = "frontend_no_bundle_ref"
+HEALTH_REASON_FRONTEND_SLOW = "frontend_slow"
+HEALTH_REASON_RECORDER_MISSING = "recorder_missing"
+HEALTH_REASON_RECORDER_DB_LARGE = "recorder_db_large"
+HEALTH_REASON_SUPERVISOR_UNHEALTHY = "supervisor_unhealthy"
+HEALTH_REASON_SUPERVISOR_UNSUPPORTED = "supervisor_unsupported"
+HEALTH_REASON_SUPERVISOR_ISSUES = "supervisor_issues"
+HEALTH_REASON_SUPERVISOR_UNREACHABLE = "supervisor_unreachable"
+HEALTH_REASON_ADDON_ERROR = "addon_error"
+HEALTH_REASON_ADDON_STOPPED = "addon_stopped"
+HEALTH_REASON_INTEGRATION_SETUP_ERROR = "integration_setup_error"
+HEALTH_REASON_INTEGRATION_SETUP_RETRY = "integration_setup_retry"
+HEALTH_REASON_ENTITIES_UNAVAILABLE = "entities_unavailable"
+
+# --- Auto-Eskalation: WebSocket-Selbsttest bei Verdacht (#147, Etappe 4) ------
+# Der belastbarste Beweis, dass Home Assistant lebt, ist die WebSocket-API — genau
+# der Kanal, über den die Oberfläche lebt. Er läuft aber NICHT im Takt mit: nur
+# wenn eine der billigen Prüfungen anschlägt, fährt der Agent ihn von sich aus,
+# um den Verdacht zu bestätigen oder zu entkräften. Solange alles grün ist,
+# kostet er exakt nichts, weil er nie stattfindet.
+HEALTH_WS_PROBE_PATH = "/api/websocket"
+# Prüfintervall des Eskalations-Wächters. Er schaut nur nach, OB ein Verdacht
+# vorliegt — das ist ein Vergleich zweier Zahlen, kein I/O.
+HEALTH_WS_PROBE_CHECK_INTERVAL_SECONDS = 30
+# Mindestabstand zwischen zwei Selbsttests. Ohne diese Drosselung hämmert eine
+# dauerhaft kranke Instanz sich selbst, und zwar genau dann, wenn es ihr ohnehin
+# schlecht geht.
+HEALTH_WS_PROBE_MIN_INTERVAL_SECONDS = 300
+# Zeit, die der Test HA zugesteht. Bewusst großzügig: ein hängender Event-Loop
+# soll als Timeout auffallen und nicht als schneller Verbindungsfehler — Letzterer
+# hätte eine ganz andere Ursache (Port zu, Prozess tot).
+HEALTH_WS_PROBE_TIMEOUT_SECONDS = 10
+# Das Frame, das Home Assistant von sich aus schickt, sobald die Verbindung steht.
+# Es entsteht im WebSocket-Handler von HA und damit im Event-Loop — genau deshalb
+# ist sein Ausbleiben aussagekräftig.
+HEALTH_WS_PROBE_EXPECTED_TYPE = "auth_required"
+
+# Der Test authentifiziert sich BEWUSST NICHT.
+#
+# Ein `auth`-Frame mit ungültigem Token ließe Home Assistant `process_wrong_login`
+# auslösen; nach genügend Fehlversuchen sperrt der IP-Ban-Mechanismus die
+# aufrufende Adresse aus — hier also 127.0.0.1, über die auch der Tunnel läuft.
+# Ein Diagnose-Werkzeug, das im Fehlerfall die Fernwartung aussperrt, wäre die
+# schlechteste denkbare Eigenschaft. Einen gültigen Token gibt es nicht: der
+# Integrator-User ist fail-closed (#110) und nur während einer freigegebenen
+# Wartungssession aktiv.
+#
+# Die Aussage bleibt trotzdem belastbar: Verbindungsaufbau, HTTP-Upgrade und das
+# `auth_required`-Frame durchlaufen den WebSocket-Handler im Event-Loop. Hängt
+# der, kommt das Frame nicht — auch dann nicht, wenn statische Dateien noch
+# ausgeliefert werden.
+
+# Ein bereits fehlgeschlagener Selbsttest ist selbst ein Verdachtsgrund. Ohne das
+# bliebe sein Befund bis zum Ende des Frischefensters stehen, auch wenn sich die
+# Instanz längst erholt hat: der Lag wäre dann wieder normal, es gäbe also keinen
+# Verdacht mehr und damit auch keinen neuen Test, der den alten Befund widerlegen
+# könnte. So prüft der Wächter alle fünf Minuten nach, und ein Fehlbefund kann
+# sich selbst entkräften.
+# Zusätzlicher Grund aus der Eskalation: der Verdacht hat sich bestätigt.
+HEALTH_REASON_WS_UNREACHABLE = "ws_unreachable"
+
+# Länge, auf die `detail` gekappt wird. Der Payload soll schlank bleiben
+# (#136); drei, vier Namen reichen als Hinweis, wo man nachsehen muss.
+HEALTH_DETAIL_MAX_LEN = 120
