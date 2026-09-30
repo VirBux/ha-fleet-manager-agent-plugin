@@ -3,8 +3,10 @@
 Beide Werte tragen `EntityCategory.CONFIG`, sodass HA sie auf der Geräteseite
 in der Sektion „Konfiguration" gruppiert.
 
-- Gültigkeitsdauer der Vorab-Freigabe (1–168 h)
-- Maximale Sitzungsdauer einer einzelnen Verbindung (1–720 h = 30 Tage)
+- Gültigkeitsdauer der Vorab-Freigabe (1–168 h) — ohne Wirkung, wenn der Switch
+  „Gültigkeit ohne Ablaufdatum" (#167) an ist
+- Maximale Sitzungsdauer einer einzelnen Verbindung (1–720 h = 30 Tage), gilt auch
+  bei einer dauerhaften Freigabe
 """
 
 from __future__ import annotations

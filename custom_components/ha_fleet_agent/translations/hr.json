@@ -49,15 +49,42 @@
           "already_resolved": "Na ovaj zahtjev već je odgovoreno."
         }
       }
+    },
+    "dashboard_outdated": {
+      "title": "Nadzorna ploča za daljinsko održavanje je zastarjela",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Ažuriraj nadzornu ploču za daljinsko održavanje",
+            "description": "Ova verzija HA Fleet Manager Agenta donosi nove elemente za nadzornu ploču **Daljinsko održavanje**. Nadzorna ploča nije automatski ažurirana jer je možda prilagođena.\n\n**Vrati na zadano** zamjenjuje nadzornu ploču trenutačnim standardnim izgledom. Tvoje vlastite izmjene na ovoj nadzornoj ploči bit će izgubljene.\n\n**Zadrži** ostavlja nadzornu ploču kakva jest. Ponovno ćeš biti upitan kada buduće ažuriranje promijeni nadzornu ploču.",
+            "menu_options": {
+              "reset": "Vrati nadzornu ploču na zadano",
+              "keep": "Zadrži moju nadzornu ploču"
+            }
+          }
+        },
+        "abort": {
+          "dashboard_missing": "Nadzorna ploča za daljinsko održavanje nije pronađena. Ponovno pokreni Home Assistant i pokušaj ponovno."
+        }
+      }
     }
   },
   "entity": {
     "sensor": {
       "connection_state": {
-        "name": "Stanje veze"
+        "name": "Stanje veze",
+        "state": {
+          "connected": "Povezano",
+          "disconnected": "Nije povezano"
+        }
       },
       "remote_access_status": {
-        "name": "Stanje daljinskog pristupa"
+        "name": "Stanje daljinskog pristupa",
+        "state": {
+          "idle": "Neaktivno",
+          "pre_authorized": "Predodobreno",
+          "session_active": "Sesija aktivna"
+        }
       },
       "preauth_expires_at": {
         "name": "Predodobrenje istječe"
@@ -74,6 +101,9 @@
     "switch": {
       "pre_authorization": {
         "name": "Predodobrenje"
+      },
+      "preauth_unlimited": {
+        "name": "Valjanost bez datuma isteka"
       }
     },
     "number": {
@@ -93,15 +123,19 @@
   "services": {
     "grant_pre_authorization": {
       "name": "Dodijeli predodobrenje",
-      "description": "Dodjeljuje vremenski ograničeno predodobrenje integratoru (vidi REQUIREMENTS §4.3). Unutar tog okvira integrator može uspostaviti vezu bez dodatne potvrde.",
+      "description": "Dodjeljuje predodobrenje integratoru (vidi REQUIREMENTS §4.3), vremenski ograničeno ili bez datuma isteka do opoziva. Dok vrijedi, integrator može uspostaviti vezu bez dodatne potvrde; svaka pojedinačna sesija ostaje vremenski ograničena.",
       "fields": {
         "expires_in_hours": {
           "name": "Vrijedi (sati)",
-          "description": "Razdoblje tijekom kojeg predodobrenje ostaje aktivno."
+          "description": "Razdoblje tijekom kojeg predodobrenje ostaje aktivno. Bez vrijednosti vrijedi postavljeno trajanje valjanosti; bez učinka uz „Valjanost bez datuma isteka”."
         },
         "max_duration_hours": {
           "name": "Maksimalno trajanje sesije (sati)",
           "description": "Maksimalno trajanje jedne sesije daljinskog pristupa."
+        },
+        "unlimited": {
+          "name": "Valjanost bez datuma isteka",
+          "description": "Predodobrenje vrijedi do opoziva. Bez vrijednosti odlučuje prekidač „Valjanost bez datuma isteka”."
         }
       }
     },

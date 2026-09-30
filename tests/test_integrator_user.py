@@ -356,3 +356,39 @@ async def test_activate_bei_geloeschtem_user_setzt_error():
     assert creds is not None
     assert creds.error == "user_missing"
     assert creds.active is False
+
+
+@pytest.mark.asyncio
+async def test_activate_entfernt_liegengebliebene_refresh_tokens():
+    """#165: Das Setup deaktiviert beim Start ohne Token-Kill, eine nach einem
+    Neustart verworfene Session endet ohne async_deactivate. Alte Tokens dürfen mit
+    der nächsten Aktivierung nicht wieder gültig werden."""
+    provider = _FakeAuthProvider()
+    hass = _FakeHass(provider)
+    manager = IntegratorUserManager(hass, entry_id="stale-entry")
+    await manager.async_setup()
+    user = await hass.auth.async_get_user(manager.credentials.user_id)
+    user.refresh_tokens = {"alt": object()}
+
+    await manager.async_activate()
+
+    assert user.refresh_tokens == {}
+    assert user.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_activate_beim_fortsetzen_behaelt_refresh_tokens():
+    """#165: Fortsetzen derselben Session nach HA-Neustart — die Tokens des noch
+    offenen Integrator-Browsers bleiben gültig."""
+    provider = _FakeAuthProvider()
+    hass = _FakeHass(provider)
+    manager = IntegratorUserManager(hass, entry_id="resume-entry")
+    await manager.async_setup()
+    user = await hass.auth.async_get_user(manager.credentials.user_id)
+    token = object()
+    user.refresh_tokens = {"browser": token}
+
+    await manager.async_activate(remove_stale_tokens=False)
+
+    assert user.refresh_tokens == {"browser": token}
+    assert user.is_active is True

@@ -37,8 +37,11 @@ _voluptuous = _ensure("voluptuous")
 
 
 class _VolStub:
+    # Hält die Konstruktor-Argumente fest, damit Tests Schemata auf Grenzen und
+    # Pflichtfelder prüfen können (#166: max_duration_hours 1–720).
     def __init__(self, *args, **kwargs):
-        pass
+        self.args = args
+        self.kwargs = kwargs
 
     def __call__(self, *args, **kwargs):
         return self
@@ -47,9 +50,17 @@ class _VolStub:
         return _VolStub()
 
 
+class _VolRequiredStub(_VolStub):
+    pass
+
+
+class _VolOptionalStub(_VolStub):
+    pass
+
+
 _voluptuous.Schema = _VolStub
-_voluptuous.Required = _VolStub
-_voluptuous.Optional = _VolStub
+_voluptuous.Required = _VolRequiredStub
+_voluptuous.Optional = _VolOptionalStub
 _voluptuous.All = _VolStub
 _voluptuous.Range = _VolStub
 _voluptuous.Coerce = _VolStub
@@ -74,6 +85,13 @@ _ha_const = _ensure("homeassistant.const")
 _ha_data_entry_flow = _ensure("homeassistant.data_entry_flow")
 _ha_components = _ensure("homeassistant.components")
 _ha_components_repairs = _ensure("homeassistant.components.repairs")
+_ha_components_persistent_notification = _ensure(
+    "homeassistant.components.persistent_notification"
+)
+_ha_components_switch = _ensure("homeassistant.components.switch")
+_ha_components_sensor = _ensure("homeassistant.components.sensor")
+_ha_helpers_entity = _ensure("homeassistant.helpers.entity")
+_ha_helpers_entity_platform = _ensure("homeassistant.helpers.entity_platform")
 _ha_components_frontend = _ensure("homeassistant.components.frontend")
 _ha_components_lovelace = _ensure("homeassistant.components.lovelace")
 _ha_components_lovelace_dashboard = _ensure(
@@ -118,6 +136,70 @@ _ha_helpers_issue_registry.IssueSeverity = _IssueSeverityStub
 _ha_helpers_issue_registry.async_create_issue = _issue_create
 _ha_helpers_issue_registry.async_delete_issue = _issue_delete
 _ha_helpers_issue_registry._test_calls = issue_registry_calls  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------- persistent_notification-Stub
+# Erinnerung an eine dauerhafte Vorab-Freigabe (#167). Tests prüfen über
+# `persistent_notification_calls`, ob und welche Notification entstand.
+
+persistent_notification_calls: list[dict] = []
+
+
+def _pn_create(hass, message, title=None, notification_id=None):  # noqa: ANN001
+    persistent_notification_calls.append(
+        {"action": "create", "message": message, "title": title, "notification_id": notification_id}
+    )
+
+
+def _pn_dismiss(hass, notification_id):  # noqa: ANN001
+    persistent_notification_calls.append({"action": "dismiss", "notification_id": notification_id})
+
+
+_ha_components_persistent_notification.async_create = _pn_create
+_ha_components_persistent_notification.async_dismiss = _pn_dismiss
+_ha_components_persistent_notification._test_calls = persistent_notification_calls  # type: ignore[attr-defined]
+_ha_components.persistent_notification = _ha_components_persistent_notification  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------- Entity-Plattform-Stubs
+# Genug, um switch.py und sensor.py zu importieren und Entities direkt zu testen
+# (#167: Switch „Ohne Ablaufdatum", Ablauf-Sensor bei dauerhafter Freigabe).
+
+
+class _EntityStub:
+    hass = None
+
+    # Wie im echten HA: Properties lesen die ``_attr_``-Felder der Entity.
+    @property
+    def unique_id(self):
+        return getattr(self, "_attr_unique_id", None)
+
+    @property
+    def entity_category(self):
+        return getattr(self, "_attr_entity_category", None)
+
+    def async_on_remove(self, _func):  # noqa: ANN001
+        return None
+
+    def async_write_ha_state(self) -> None:
+        return None
+
+
+class _EntityCategoryStub(enum.Enum):
+    CONFIG = "config"
+    DIAGNOSTIC = "diagnostic"
+
+
+class _SensorDeviceClassStub:
+    ENUM = "enum"
+    TIMESTAMP = "timestamp"
+
+
+_ha_components_switch.SwitchEntity = _EntityStub
+_ha_components_sensor.SensorEntity = _EntityStub
+_ha_components_sensor.SensorDeviceClass = _SensorDeviceClassStub
+_ha_helpers_entity.EntityCategory = _EntityCategoryStub
+_ha_helpers_entity_platform.AddEntitiesCallback = object
 
 
 # --------------------------------------------------------- Entity-Registry-Stubs
@@ -202,6 +284,12 @@ class _LovelaceStorageStub:
         self.saved: dict | None = None
         self.deleted: bool = False
 
+    async def async_load(self, force: bool) -> dict:  # noqa: ARG002
+        # Wie das echte LovelaceStorage: leerer Store → ConfigNotFound.
+        if self.saved is None:
+            raise _ConfigNotFoundStub
+        return self.saved
+
     async def async_save(self, config: dict) -> None:
         self.saved = config
 
@@ -209,7 +297,13 @@ class _LovelaceStorageStub:
         self.deleted = True
 
 
+class _ConfigNotFoundStub(Exception):
+    """Stub für `homeassistant.components.lovelace.const.ConfigNotFound`."""
+
+
 _ha_components_lovelace_dashboard.LovelaceStorage = _LovelaceStorageStub
+_ha_components_lovelace_const = _ensure("homeassistant.components.lovelace.const")
+_ha_components_lovelace_const.ConfigNotFound = _ConfigNotFoundStub
 
 
 class _HomeAssistantStub:
@@ -256,11 +350,18 @@ def _dispatcher_connect(*args, **kwargs):
 _ha_helpers_dispatcher.async_dispatcher_connect = _dispatcher_connect
 
 
+# Aufgezeichnete async_call_later-Aufrufe (hass, delay, action) — Tests können
+# darüber den geplanten Delay prüfen (`_ha_helpers_event._test_calls`).
+call_later_calls: list[tuple] = []
+
+
 def _call_later(*args, **kwargs):
+    call_later_calls.append(args)
     return lambda: None
 
 
 _ha_helpers_event.async_call_later = _call_later
+_ha_helpers_event._test_calls = call_later_calls  # type: ignore[attr-defined]
 
 
 def _track_time_interval(*args, **kwargs):

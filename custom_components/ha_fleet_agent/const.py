@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.11.0"
+VERSION = "1.15.0"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -244,6 +244,26 @@ DEFAULT_PREAUTH_MAX_HOURS = 4
 DEFAULT_PREAUTH_VALIDITY_HOURS = 8
 MAX_SESSION_HOURS = 720  # 30 Tage (30 * 24 h) — Obergrenze fuer Tunnel-/Sitzungsdauer
 MAX_PREAUTH_VALIDITY_HOURS = 168  # 7 Tage
+# Dauerhafte Vorab-Freigabe (#167): Sie gilt bis zum Widerruf. Statt der Befristung
+# schützt eine Erinnerung alle 30 Tage davor, dass sie in Vergessenheit gerät;
+# geprüft wird einmal täglich (und nach dem Laden).
+PREAUTH_REMINDER_INTERVAL_DAYS = 30
+PREAUTH_REMINDER_CHECK_HOURS = 24
+# Abgleich lokal ↔ Backend über das Poll-Feld ``preauth`` (#167): Bleibt eine
+# Abweichung nach einem Meldeversuch bestehen, wartet das Plugin 1, 2, 4 … höchstens
+# 60 Minuten bis zum nächsten Versuch — statt im 15-s-Poll-Takt zu feuern.
+PREAUTH_SYNC_BACKOFF_MAX_MINUTES = 60
+# Wie viele vom Plugin beendete Anfragen gemerkt werden, damit ein spätes
+# connection_accepted sie nie wiederbelebt (#165). Mehr als die letzten paar
+# Anfragen kommen im Poll ohnehin nicht zurück.
+MAX_REMEMBERED_ENDED_REQUESTS = 20
+# Neuaufbau derselben Anfrage (#165): kurze Pause zwischen Close und neuem
+# Connect, damit der Close-Notify des alten Tunnels (gleicher Slug) vor dem
+# Credentials-POST des neuen beim Backend ankommt und der Connector den Slug
+# freigegeben hat. Wiederholte Neuaufbauten werden exponentiell gebremst.
+REBUILD_SETTLE_SECONDS = 2.0
+REBUILD_BACKOFF_BASE_SECONDS = 15.0
+REBUILD_BACKOFF_MAX_SECONDS = 300.0
 
 # Konfigurations-Storage-Keys
 DATA_PREAUTH_VALIDITY = "preauth_validity"
@@ -454,3 +474,66 @@ HEALTH_REASON_WS_UNREACHABLE = "ws_unreachable"
 # Länge, auf die `detail` gekappt wird. Der Payload soll schlank bleiben
 # (#136); drei, vier Namen reichen als Hinweis, wo man nachsehen muss.
 HEALTH_DETAIL_MAX_LEN = 120
+
+# ---------------------------------------------------------------------------
+# Backup auf Knopfdruck (#168)
+# ---------------------------------------------------------------------------
+# Der Integrator löst in Fleet Manager ein Backup aus. Das Plugin erzeugt es über
+# den Backup-Manager von HA — verschlüsselt mit dem Schlüssel aus dem Notfallkit —,
+# lädt es in Stücken hoch. Eine Kopie bleibt in HA; ältere Fleet-Manager-Backups
+# räumt das Plugin selbst ab (#201).
+
+# Frühestes HA mit ``backup.async_get_manager`` als synchroner, öffentlicher
+# Funktion. 2025.3 bis 2025.7 gab es ihn nur asynchron unter ``helpers.backup``.
+BACKUP_MIN_HA_VERSION = (2025, 8)
+
+# Lokale Backup-Agents von HA: ``hassio.local`` mit Supervisor (HA OS), sonst
+# ``backup.local`` (Core/Container). Reihenfolge = Vorrang.
+BACKUP_LOCAL_AGENT_IDS = ("hassio.local", "backup.local")
+
+# Markierung in ``extra_metadata`` des Backups. Darüber findet das Plugin „sein“
+# Backup wieder — die ``backup_job_id`` taugt dafür nicht, auf HA OS ist sie eine
+# Job-ID des Supervisors — und erkennt Reste nach einem Neustart.
+BACKUP_METADATA_KEY = "fleet_agent.request_id"
+# Ordner, die HA für ein Backup kennt (Enum ``homeassistant.components.backup.Folder``) —
+# nur diese darf eine eigene Auswahl aus Fleet Manager enthalten (#203).
+BACKUP_FOLDERS = ("media", "share", "ssl", "addons/local")
+
+# So viele Fleet-Manager-Backups bleiben in HA liegen, das neueste zuerst (#201,
+# N = 1). HA löscht sie nie selbst: Als manuelle Backups fallen sie nicht unter
+# dessen Aufbewahrungsregel. Backups des Kunden (ohne Markierung) zählen nicht mit.
+BACKUP_KEEP_LOCAL = 1
+# Namenszusatz, an dem der Kunde die Kopie in HA erkennt. Fest, nicht übersetzt.
+BACKUP_NAME_SUFFIX = "_for-download"
+
+# Auftragszustand über HA-Neustarts hinweg, je Config-Entry.
+BACKUP_STORAGE_KEY_PREFIX = f"{DOMAIN}.backup_jobs"
+# So viele erledigte Aufträge merkt sich das Plugin, um eine erneute Zustellung
+# zu beantworten statt ein zweites Backup zu erzeugen.
+BACKUP_DONE_HISTORY = 20
+
+# Stückgröße, falls das Backend keine mitschickt. 4 MiB brauchen bei 1 Mbit/s
+# rund 34 s und bleiben unter den 60 s, nach denen Traefik einen Request abbricht.
+BACKUP_CHUNK_BYTES = 4 * 1024 * 1024
+BACKUP_MAX_BYTES = 2 * 1024 * 1024 * 1024
+# Zeitlimit je Stück — knapp unter der Traefik-Grenze.
+BACKUP_CHUNK_TIMEOUT_SECONDS = 50
+# Versuche je Stück bei Netzfehler, Timeout oder 5xx, dazwischen diese Pausen.
+BACKUP_CHUNK_ATTEMPTS = 5
+BACKUP_CHUNK_BACKOFF_SECONDS = (1, 2, 5, 10)
+# Wartet das Backend wegen belegter Upload-Plätze (503), zählt das nicht als
+# Fehlversuch; nach so vielen Wartezeiten gibt das Plugin trotzdem auf.
+BACKUP_MAX_SLOT_WAITS = 60
+BACKUP_DEFAULT_RETRY_AFTER_SECONDS = 30
+# Der Abschluss rechnet im Backend den SHA-256 über bis zu 2 GB — großzügig warten.
+BACKUP_COMPLETE_TIMEOUT_SECONDS = 300
+# Meldungen ans Backend: Zeitlimit und Pausen zwischen drei Versuchen.
+BACKUP_REPORT_TIMEOUT_SECONDS = 15
+BACKUP_REPORT_BACKOFF_SECONDS = (2, 5)
+# Frist fürs Erzeugen in HA; das Backend gibt nach 60 min auf, das Plugin kurz davor.
+BACKUP_CREATE_TIMEOUT_SECONDS = 55 * 60
+# Beim Lesen einer lokalen Backup-Datei (Core/Container) je Aufruf im Executor.
+BACKUP_READ_PIECE_BYTES = 1024 * 1024
+# Fortsetzen nach einem HA-Neustart: Versuche, bis das Backend erreichbar ist.
+BACKUP_RESUME_ATTEMPTS = 5
+BACKUP_RESUME_RETRY_SECONDS = 60

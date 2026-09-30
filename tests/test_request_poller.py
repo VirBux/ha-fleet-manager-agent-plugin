@@ -288,3 +288,68 @@ async def test_204_dispatcht_idle_action():
 
     assert len(idle_calls) == 1
     assert idle_calls[0]["action"] == "idle"
+
+
+# --------------------------------------------------------- Antwort-Listener (#167)
+
+
+@pytest.mark.asyncio
+async def test_idle_mit_body_dispatcht_idle_handler_und_listener():
+    """Seit #167 meldet das Backend den Leerlauf als 200 {"action": "idle"} statt 204.
+    Der idle-Handler (#90) greift wie bisher, der Listener sieht das Feld preauth."""
+    payload = {"action": "idle", "preauth": None}
+    session = FakeSession(_FakeResponse(200, payload))
+    poller = RequestPoller(FakeHass(), session, "https://api.ha-fleet-manager.com", "key")
+    order: list[str] = []
+
+    async def idle_handler(_data: dict) -> None:
+        order.append("idle")
+
+    async def listener(data: dict) -> None:
+        order.append(f"listener:{'preauth' in data}")
+
+    poller.register_handler("idle", idle_handler)
+    poller.add_response_listener(listener)
+
+    await poller._poll_once()
+
+    assert order == ["idle", "listener:True"], "Listener läuft nach dem Dispatch"
+
+
+@pytest.mark.asyncio
+async def test_listener_bekommt_bei_204_nichts():
+    """Älteres Backend: 204 ohne Body — kein Abgleich möglich, kein Listener-Aufruf."""
+    session = FakeSession(_FakeResponse(204))
+    poller = RequestPoller(FakeHass(), session, "https://api.ha-fleet-manager.com", "key")
+    seen: list[dict] = []
+
+    async def listener(data: dict) -> None:
+        seen.append(data)
+
+    poller.add_response_listener(listener)
+
+    await poller._poll_once()
+
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_fehler_im_listener_bricht_den_poll_nicht_ab():
+    payload = {"action": "connection_request", "requestId": "req-1", "preauth": None}
+    session = FakeSession(_FakeResponse(200, payload))
+    poller = RequestPoller(FakeHass(), session, "https://api.ha-fleet-manager.com", "key")
+    received: list[dict] = []
+
+    async def handler(data: dict) -> None:
+        received.append(data)
+
+    async def broken(_data: dict) -> None:
+        raise RuntimeError("kaputt")
+
+    poller.register_handler("connection_request", handler)
+    poller.add_response_listener(broken)
+
+    await poller._poll_once()
+
+    assert len(received) == 1
+    assert poller._polling is False

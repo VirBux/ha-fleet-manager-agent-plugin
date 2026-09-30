@@ -49,15 +49,42 @@
           "already_resolved": "Esta solicitud ya ha sido respondida."
         }
       }
+    },
+    "dashboard_outdated": {
+      "title": "El panel de mantenimiento remoto está desactualizado",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Actualizar el panel de mantenimiento remoto",
+            "description": "Esta versión de HA Fleet Manager Agent incluye nuevos elementos para el panel **Mantenimiento remoto**. El panel no se ha actualizado automáticamente porque es posible que se haya personalizado.\n\n**Restablecer** sustituye el panel por el diseño estándar actual. Se perderán tus propios cambios en este panel.\n\n**Conservar** deja el panel como está. Se te volverá a preguntar cuando una actualización futura cambie el panel.",
+            "menu_options": {
+              "reset": "Restablecer el panel",
+              "keep": "Conservar mi panel"
+            }
+          }
+        },
+        "abort": {
+          "dashboard_missing": "No se ha encontrado el panel de mantenimiento remoto. Reinicia Home Assistant e inténtalo de nuevo."
+        }
+      }
     }
   },
   "entity": {
     "sensor": {
       "connection_state": {
-        "name": "Estado de conexión"
+        "name": "Estado de conexión",
+        "state": {
+          "connected": "Conectado",
+          "disconnected": "Desconectado"
+        }
       },
       "remote_access_status": {
-        "name": "Estado del acceso remoto"
+        "name": "Estado del acceso remoto",
+        "state": {
+          "idle": "Inactivo",
+          "pre_authorized": "Autorizado previamente",
+          "session_active": "Sesión activa"
+        }
       },
       "preauth_expires_at": {
         "name": "La autorización previa caduca"
@@ -74,6 +101,9 @@
     "switch": {
       "pre_authorization": {
         "name": "Autorización previa"
+      },
+      "preauth_unlimited": {
+        "name": "Validez sin fecha de caducidad"
       }
     },
     "number": {
@@ -93,15 +123,19 @@
   "services": {
     "grant_pre_authorization": {
       "name": "Conceder autorización previa",
-      "description": "Concede una autorización previa de duración limitada al integrador (véase REQUIREMENTS §4.3). Dentro de ese intervalo, el integrador puede abrir una conexión sin más confirmación.",
+      "description": "Concede una autorización previa al integrador (véase REQUIREMENTS §4.3), de duración limitada o sin fecha de caducidad hasta su revocación. Mientras esté vigente, el integrador puede abrir una conexión sin más confirmación; cada sesión sigue siendo limitada.",
       "fields": {
         "expires_in_hours": {
           "name": "Válida durante (horas)",
-          "description": "Intervalo de tiempo durante el cual la autorización previa permanece activa."
+          "description": "Intervalo de tiempo durante el cual la autorización previa permanece activa. Sin valor, se aplica la duración de validez configurada; sin efecto con «Validez sin fecha de caducidad»."
         },
         "max_duration_hours": {
           "name": "Duración máxima de sesión (horas)",
           "description": "Duración máxima de una sola sesión de acceso remoto."
+        },
+        "unlimited": {
+          "name": "Validez sin fecha de caducidad",
+          "description": "La autorización previa es válida hasta que se revoque. Sin valor, decide el interruptor «Validez sin fecha de caducidad»."
         }
       }
     },

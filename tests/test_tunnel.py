@@ -468,6 +468,46 @@ async def test_handover_close_delete_aber_kein_session_ende_kein_reconnect(make_
 
 
 @pytest.mark.asyncio
+async def test_rebuild_close_kein_delete_kein_session_ende_kein_reconnect():
+    """REBUILD (dieselbe Anfrage wird neu aufgebaut) → KEIN DELETE: der würde genau
+    diese Anfrage im Backend auf CLOSED setzen. Auch kein Session-Ende und kein
+    Reconnect — den Neuaufbau übernimmt der connection_accepted-Handler selbst."""
+    close_calls: list[str] = []
+    reconnect_calls: list[int] = []
+
+    async def on_close():
+        close_calls.append("called")
+
+    ws_client = FakeWsClient()
+    user = FakeIntegratorUser(FakeCredentials())
+    hass = FakeHass()
+    http_session = FakeHttpSession(
+        rest_handler=lambda call: _FakeResponse(204, b"", {})
+    )
+    fwd = TunnelForwarder(
+        hass, ws_client, user,
+        backend_url="https://api.ha-fleet-manager.com",
+        api_key="test-api-key-1234567890",
+        http_session=http_session,
+        on_close=on_close,
+    )
+    fwd.set_reconnect_callback(lambda: reconnect_calls.append(1))
+    fwd._active_tunnel_slug = "abc12345"
+    fwd.set_active_tunnel_token("tt-alt")
+    fwd.set_active_request_id("req-1")
+    fwd.mark_rebuild_close()
+
+    fwd._on_tunnel_closed()
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    delete_calls = [c for c in http_session.rest_calls if c["method"] == "DELETE"]
+    assert delete_calls == [], "Neuaufbau darf die Anfrage im Backend nicht schließen"
+    assert close_calls == [], "Neuaufbau darf die Session nicht beenden"
+    assert reconnect_calls == [], "Neuaufbau darf keinen Reconnect auslösen"
+    assert fwd.active_request_id is None, "Lokaler Tunnel-Zustand wird zurückgesetzt"
+
+
+@pytest.mark.asyncio
 async def test_delete_credentials_sendet_x_tunnel_token_header(make_forwarder):
     """Direkter Aufruf: _delete_credentials(slug, token) sendet einen DELETE mit
     X-Tunnel-Token == token (+ X-API-Key). Das Backend loest darueber den
@@ -1434,3 +1474,69 @@ async def test_relay_chunked_message_von_connector_an_ha_reassembliert(make_forw
     })
 
     assert ha_ws.sent_text == ["AAABBBCCC"]
+
+
+
+@pytest.mark.asyncio
+async def test_session_ende_und_tunnel_close_terminieren_gemeinsam():
+    """#165, echte Objekte: Session-Ende schließt den Tunnel (Callback), der END-Close
+    ruft on_close → async_end_session, das keine Session mehr findet. Die Kette
+    terminiert, der Tunnel wird genau einmal geschlossen, der User einmal deaktiviert."""
+    import datetime
+
+    from ha_fleet_agent.remote_access import PreAuthorization, RemoteAccessManager
+    from homeassistant.util import dt as dt_util  # noqa: PLC0415
+
+    class _User:
+        def __init__(self):
+            self.activated = 0
+            self.deactivated = 0
+            self.credentials = FakeCredentials()
+
+        async def async_activate(self, *, remove_stale_tokens=True):
+            self.activated += 1
+            return FakeCredentials()
+
+        async def async_deactivate(self):
+            self.deactivated += 1
+
+        async def async_refresh_status(self):
+            return None
+
+    hass = FakeHass()
+    ws_client = FakeWsClient()
+    user = _User()
+    http_session = FakeHttpSession(rest_handler=lambda call: _FakeResponse(204, b"", {}))
+    mgr_holder: dict = {}
+
+    async def on_close():
+        await mgr_holder["mgr"].async_end_session(reason="tunnel_closed")
+
+    fwd = TunnelForwarder(
+        hass, ws_client, user,
+        backend_url="https://api.ha-fleet-manager.com",
+        api_key="test-api-key-1234567890",
+        http_session=http_session,
+        on_close=on_close,
+    )
+    mgr = RemoteAccessManager(
+        hass, entry_id="e2e", session=http_session,
+        backend_url="https://api.ha-fleet-manager.com",
+        api_key="test-api-key-1234567890", integrator_user=user,
+    )
+    mgr_holder["mgr"] = mgr
+    mgr.set_session_end_callback(fwd.async_close_tunnel)
+    mgr._pre_auth = PreAuthorization(
+        expires_at=dt_util.utcnow() + datetime.timedelta(hours=2), max_duration_hours=1
+    )
+    assert await mgr.async_ensure_session_for_accepted("req-1") is True
+    ws_client.is_connected = True
+    fwd.set_active_request_id("req-1")
+    fwd._active_tunnel_slug = "abc12345"
+
+    await mgr.async_end_session(reason="timeout")
+    await asyncio.gather(*hass._tasks, return_exceptions=True)
+
+    assert ws_client.disconnect_calls == 1
+    assert user.deactivated == 1
+    assert mgr.session is None

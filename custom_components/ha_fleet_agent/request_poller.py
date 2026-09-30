@@ -3,8 +3,11 @@
 GET {backend_url}/api/agent/poll mit X-API-Key-Header.
 
 Antwort-Semantik:
-  204 No Content  → nichts zu tun
-  200 OK          → JSON mit "action"-Feld; Dispatch an registrierte Handler
+  204 No Content  → nichts zu tun (Backend vor #167)
+  200 OK          → JSON mit "action"-Feld; Dispatch an registrierte Handler.
+                    Seit #167 meldet das Backend den Leerlauf als "idle" und legt
+                    jeder Antwort die Backend-Sicht der Vorab-Freigabe bei
+                    ("preauth") — dafür gibt es Antwort-Listener.
 
 Bekannte Actions:
   "connection_request"  → RemoteAccessManager._on_connection_request(data)
@@ -58,10 +61,20 @@ class RequestPoller:
 
         # Handler-Registry: action-Name → async Callable
         self._handlers: dict[str, ActionHandler] = {}
+        # Listener für jede Poll-Antwort mit Body, unabhängig von der Action (#167).
+        self._response_listeners: list[ActionHandler] = []
 
     def register_handler(self, action: str, handler: ActionHandler) -> None:
         """Registriert einen Handler für eine bestimmte action."""
         self._handlers[action] = handler
+
+    def add_response_listener(self, listener: ActionHandler) -> None:
+        """Registriert einen Listener, der jede Poll-Antwort mit Body sieht.
+
+        Läuft nach dem Dispatch, damit etwa ein Abgleich mit Netzwerk-Call den
+        Tunnel-Aufbau aus ``connection_accepted`` nicht verzögert.
+        """
+        self._response_listeners.append(listener)
 
     def start(self) -> None:
         """Startet den Polling-Timer. Erster Poll direkt nach dem Intervall."""
@@ -125,6 +138,7 @@ class RequestPoller:
                         )
                         return
                     await self._dispatch(data)
+                    await self._notify_listeners(data)
                     return
 
                 if resp.status in (401, 403):
@@ -152,6 +166,16 @@ class RequestPoller:
             _LOGGER.warning("Poll-Request Timeout (>10 s)")
         except aiohttp.ClientError as err:
             _LOGGER.warning("Poll-Netzwerkfehler: %s", err)
+
+    async def _notify_listeners(self, data: Any) -> None:
+        """Ruft alle Antwort-Listener auf; ein Fehler bricht den Poller nicht ab."""
+        if not isinstance(data, dict):
+            return
+        for listener in self._response_listeners:
+            try:
+                await listener(data)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Listener für die Poll-Antwort ist ausgefallen")
 
     async def _dispatch(self, data: dict[str, Any]) -> None:
         """Ruft den zum action-Feld passenden Handler auf."""

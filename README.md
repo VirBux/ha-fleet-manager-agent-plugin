@@ -22,6 +22,12 @@ port forwarding. Remote access is always **client-controlled**.
   Assistant UI through an encrypted tunnel over the relay — no inbound ports, no VPN.
 - **Connection requests in the HA UI**: incoming access requests appear as a Repair issue
   the customer can accept or reject, with an adjustable session duration.
+- **Backup on demand** (Home Assistant 2025.8 or newer): the integrator can request a fresh
+  backup in the Fleet Manager. The agent creates it with Home Assistant's backup manager on the
+  local backup location, encrypted with this instance's backup key, and uploads it in chunks.
+  A copy named `Fleet Manager <date> <time>_for-download` stays in Home Assistant; each new one
+  replaces the previous one, your own backups are never touched. The request is refused if
+  local backups are stored unencrypted.
 - **Auto-generated remote-maintenance dashboard**: a dedicated Lovelace dashboard with
   status, control and action cards is created automatically on first setup (existing
   dashboards are never touched).
@@ -75,6 +81,12 @@ While running, the agent sends a periodic status payload to your Fleet Manager b
 (HA version, integration/automation inventory, critical error logs, host metrics). The Home
 Assistant UI is only ever reachable when **you** enable remote access; outside an active
 session no UI traffic leaves the instance.
+
+If the integrator requests a backup on demand, the agent uploads one backup of this instance
+to the Fleet Manager. It is always encrypted with your Home Assistant backup key; the agent
+never transmits that key, and without it (emergency kit) the backup can neither be read nor
+restored. The Fleet Manager keeps the file only until it has been downloaded, at most 24 hours.
+The newest of these backups also stays on this instance's local backup location.
 
 ## Support
 

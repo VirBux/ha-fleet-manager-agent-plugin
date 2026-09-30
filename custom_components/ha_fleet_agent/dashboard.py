@@ -2,7 +2,7 @@
 
 REQUIREMENTS Sec. 4.6 / TODO #91 — beim Einrichten des Plugins entsteht in der
 HA-Instanz des Endkunden automatisch ein eigenes Lovelace-Dashboard
-(url_path 'ha-fleet-manager', Storage-Mode) als Surface fuer die 9 Plugin-Entities.
+(url_path 'ha-fleet-manager', Storage-Mode) als Surface für die 10 Plugin-Entities.
 
 **Sprache (TODO #100, Plugin 0.7.0/0.7.1; FR/HR/ES ergaenzt 1.5.0):** Texte
 (Sidebar-Titel, Intro-Markdown, Sektions-Headings, Tile-Namen) sind ueber
@@ -45,13 +45,30 @@ Daher umgekehrter Weg:
   Karten-Store → konsistente Sicht fuer den Endkunden.
 
 **Idempotenz:** Eigener Flag-Store ``{DOMAIN}.dashboard`` mit
-``{created, url_path, dashboard_id, template_version, language}``. Existiert
+``{created, url_path, dashboard_id, template_version, language, config_hash}``. Existiert
 das Dashboard schon (vom Kunden manuell angelegt, gleicher ``url_path``),
 wird es respektiert (kein Ueberschreiben). Das Plugin merkt sich beim ersten
 Lauf seine eigene ``dashboard_id`` und ``language`` und hat damit dauerhaft
 Zugriff auf seinen Karten-Store und den Sprachstand. Fehlt ``language`` im
 Flag (Bestands-Installationen < 0.7.0), wird ``"de"`` angenommen (alter
 Sidebar-Titel und Dashboard waren auf Deutsch).
+
+**Aktualisierung nach Plugin-Updates (#204):** Der Flag-Store hält zusätzlich
+``config_hash`` — den SHA-256 der Karten-Config, die das Plugin zuletzt selbst
+geschrieben hat. Ist ``template_version`` im Flag älter als
+``DASHBOARD_TEMPLATE_VERSION``, vergleicht das Plugin beim Start den Hash der
+gespeicherten Config damit:
+
+- gleich (oder Store leer) → Dashboard ist unverändert, die neue Config wird
+  geschrieben;
+- ungleich oder kein Hash im Flag (Bestand vor #204) → der Kunde hat es
+  möglicherweise angepasst. Nichts wird geschrieben, stattdessen erscheint das
+  Repair-Issue ``dashboard_outdated`` mit „Zurücksetzen" / „Behalten".
+
+**Regel:** Jede Änderung an ``build_dashboard_config`` oder an
+``_DASHBOARD_TEXTS`` bumpt ``DASHBOARD_TEMPLATE_VERSION``. Sonst bekommen
+Bestandsinstallationen die Änderung nie zu sehen. Ein Schutztest
+(``test_template_hash_passt_zur_template_version``) fällt sonst rot aus.
 
 **Cleanup:** Nur bei vollstaendiger Entfernung (``async_remove_entry``),
 NICHT bei Reload. Loescht den ``lovelace.<uuid>``-Store, entfernt den
@@ -62,6 +79,8 @@ Alle Lovelace-Zugriffe sind defensiv gekapselt — bricht das Setup nie.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import uuid
 from typing import Any
@@ -69,6 +88,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 
 from .const import (
@@ -82,7 +102,13 @@ _LOGGER = logging.getLogger(__name__)
 
 DASHBOARD_URL_PATH = "ha-fleet-manager"
 DASHBOARD_ICON = "mdi:remote-desktop"
-DASHBOARD_TEMPLATE_VERSION = 1
+# Version 2 (#204): Switch „Gültigkeit ohne Ablaufdatum", Karte „Dauerhaft
+# freigegeben" (#167). Bei jeder Template-Änderung anheben (siehe Docstring).
+DASHBOARD_TEMPLATE_VERSION = 2
+
+# Repair-Issue, wenn ein angepasstes Dashboard nicht automatisch aktualisiert
+# werden darf. Feste ID — es gibt nur ein Dashboard je Instanz.
+DASHBOARD_OUTDATED_ISSUE_ID = "dashboard_outdated"
 
 _DASHBOARD_STORAGE_VERSION = 1
 _DASHBOARD_STORAGE_KEY = f"{DOMAIN}.dashboard"
@@ -103,6 +129,7 @@ ENTITY_SLOTS: tuple[tuple[str, str, str], ...] = (
     ("preauth_expires_at", "sensor", "_preauth_expires_at"),
     ("session_ends_at", "sensor", "_session_ends_at"),
     ("pre_authorization", "switch", "_pre_authorization"),
+    ("preauth_unlimited", "switch", "_preauth_unlimited"),
     ("preauth_validity", "number", "_preauth_validity"),
     ("preauth_max_duration", "number", "_preauth_max_duration"),
     ("close_tunnel", "button", "_close_tunnel"),
@@ -144,14 +171,17 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
         "status_section_title": "Status",
         "status_help": (
             "Auf einen Blick: was passiert gerade?\n\n"
-            "- **Fernzugriffs-Status** — Gesamtzustand: *idle* (nichts läuft), "
-            "*pre_authorized* (Vorab-Freigabe aktiv) oder *session_active* "
+            "- **Fernzugriffs-Status** — Gesamtzustand: *Inaktiv* (nichts läuft), "
+            "*Vorab freigegeben* (Vorab-Freigabe aktiv) oder *Sitzung aktiv* "
             "(Wartung läuft).\n"
             "- **Tunnel aktiv** — *Ja*, sobald dein Team gerade verbunden ist.\n"
             "- **Verbindungsstatus** — Verbindung des Plugins zum Fleet-Manager-"
-            "Server. Sollte normalerweise *connected* sein.\n"
+            "Server. Sollte normalerweise *Verbunden* sein.\n"
             "- **Vorab-Freigabe läuft ab** / **Aktive Sitzung endet** — Zeitpunkte, "
             "an denen eine Freigabe bzw. eine laufende Sitzung automatisch endet."
+            "\n- Bei einer Vorab-Freigabe **ohne Ablaufdatum** bleibt "
+            "*Vorab-Freigabe läuft ab* leer; stattdessen erscheint der Hinweis "
+            "*Dauerhaft freigegeben*."
         ),
         "control_section_title": "Vorab-Freigabe (Steuerung)",
         "control_help": (
@@ -166,6 +196,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "Wartungssitzung maximal laufen — z.B. 4 h).\n\n"
             "Schalte die Vorab-Freigabe wieder aus, sobald du sie nicht mehr "
             "brauchst — du behältst so die volle Kontrolle."
+            "\n\n**Gültigkeit ohne Ablaufdatum** — die Freigabe gilt, bis du sie ausschaltest, "
+            "statt nach der Gültigkeitsdauer zu verfallen. Gedacht für "
+            "Installationen, die dein Team dauerhaft betreut. Jede einzelne "
+            "Sitzung bleibt auf die max. Sitzungsdauer begrenzt, und Home "
+            "Assistant erinnert dich alle 30 Tage an die Freigabe. Der Schalter "
+            "wirkt beim nächsten Einschalten der Vorab-Freigabe; eine laufende "
+            "Freigabe bleibt, wie sie ist."
+        ),
+        "unlimited_card": (
+            "**Dauerhaft freigegeben** — die Vorab-Freigabe gilt bis zum "
+            "Widerruf. Jede einzelne Sitzung bleibt auf die max. Sitzungsdauer "
+            "begrenzt."
         ),
         "action_section_title": "Aktionen",
         "action_help": (
@@ -183,6 +225,7 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "preauth_expires_at": "Vorab-Freigabe läuft ab",
             "session_ends_at": "Aktive Sitzung endet",
             "pre_authorization": "Vorab-Freigabe",
+            "preauth_unlimited": "Gültigkeit ohne Ablaufdatum",
             "preauth_validity": "Gültigkeitsdauer",
             "preauth_max_duration": "Max. Sitzungsdauer",
             "close_tunnel": "Tunnel trennen",
@@ -218,15 +261,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
         "status_section_title": "Status",
         "status_help": (
             "At a glance: what is happening right now?\n\n"
-            "- **Remote access status** — Overall state: *idle* (nothing running), "
-            "*pre_authorized* (pre-authorization active) or *session_active* "
+            "- **Remote access status** — Overall state: *Idle* (nothing running), "
+            "*Pre-authorized* (pre-authorization active) or *Session active* "
             "(maintenance in progress).\n"
             "- **Tunnel active** — *Yes* as soon as your team is currently "
             "connected.\n"
             "- **Connection status** — Connection from the plugin to the Fleet "
-            "Manager server. Should normally be *connected*.\n"
+            "Manager server. Should normally be *Connected*.\n"
             "- **Pre-authorization expires at** / **Active session ends** — Times "
             "at which a pre-authorization or a running session ends automatically."
+            "\n- With a pre-authorization **without expiry date**, "
+            "*Pre-authorization expires at* stays empty; the note *Permanently "
+            "authorized* appears instead."
         ),
         "control_section_title": "Pre-authorization (controls)",
         "control_help": (
@@ -241,6 +287,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "session may run at most — e.g. 4 h).\n\n"
             "Switch the pre-authorization off again as soon as you don't need it "
             "any more — that way you stay in full control."
+            "\n\n**Validity without expiry date** — the pre-authorization stays valid until "
+            "you switch it off instead of expiring after the validity duration. "
+            "Meant for installations your team looks after permanently. Each "
+            "individual session is still limited to the max. session duration, "
+            "and Home Assistant reminds you of the pre-authorization every 30 "
+            "days. The switch takes effect the next time you switch on the "
+            "pre-authorization; a running one stays as it is."
+        ),
+        "unlimited_card": (
+            "**Permanently authorized** — the pre-authorization applies until "
+            "revoked. Each individual session is still limited to the max. "
+            "session duration."
         ),
         "action_section_title": "Actions",
         "action_help": (
@@ -257,6 +315,7 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "preauth_expires_at": "Pre-authorization expires at",
             "session_ends_at": "Active session ends",
             "pre_authorization": "Pre-authorization",
+            "preauth_unlimited": "Validity without expiry date",
             "preauth_validity": "Validity duration",
             "preauth_max_duration": "Max. session duration",
             "close_tunnel": "Close tunnel",
@@ -293,15 +352,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
         "status_section_title": "Estado",
         "status_help": (
             "De un vistazo: ¿qué está pasando ahora mismo?\n\n"
-            "- **Estado del acceso remoto** — estado general: *idle* (no hay nada en "
-            "marcha), *pre_authorized* (autorización previa activa) o "
-            "*session_active* (mantenimiento en curso).\n"
+            "- **Estado del acceso remoto** — estado general: *Inactivo* (no hay nada en "
+            "marcha), *Autorizado previamente* (autorización previa activa) o "
+            "*Sesión activa* (mantenimiento en curso).\n"
             "- **Túnel activo** — *Sí* en cuanto tu equipo está conectado.\n"
             "- **Estado de conexión** — conexión del plugin con el servidor de Fleet "
-            "Manager. Normalmente debería estar *connected*.\n"
+            "Manager. Normalmente debería estar *Conectado*.\n"
             "- **La autorización previa caduca** / **La sesión activa termina** — "
             "momentos en los que una autorización o una sesión en curso finaliza "
             "automáticamente."
+            "\n- Con una autorización previa **sin fecha de caducidad**, *La "
+            "autorización previa caduca* queda vacío; en su lugar aparece el "
+            "aviso *Autorizado de forma permanente*."
         ),
         "control_section_title": "Autorización previa (control)",
         "control_help": (
@@ -316,6 +378,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "una sola sesión de mantenimiento — p. ej. 4 h).\n\n"
             "Vuelve a desactivar la autorización previa en cuanto ya no la "
             "necesites; así mantienes el control total."
+            "\n\n**Validez sin fecha de caducidad**: la autorización previa sigue vigente "
+            "hasta que la desactives, en lugar de caducar tras la duración de "
+            "validez. Pensado para instalaciones que tu equipo atiende de forma "
+            "permanente. Cada sesión sigue limitada a la duración máx. de sesión, "
+            "y Home Assistant te la recuerda cada 30 días. El interruptor se "
+            "aplica la próxima vez que actives la autorización previa; una "
+            "autorización en curso no cambia."
+        ),
+        "unlimited_card": (
+            "**Autorizado de forma permanente**: la autorización previa es válida "
+            "hasta su revocación. Cada sesión sigue limitada a la duración máx. "
+            "de sesión."
         ),
         "action_section_title": "Acciones",
         "action_help": (
@@ -333,6 +407,7 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "preauth_expires_at": "La autorización previa caduca",
             "session_ends_at": "La sesión activa termina",
             "pre_authorization": "Autorización previa",
+            "preauth_unlimited": "Validez sin fecha de caducidad",
             "preauth_validity": "Duración de validez",
             "preauth_max_duration": "Duración máx. de sesión",
             "close_tunnel": "Cerrar túnel",
@@ -371,15 +446,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
         "status_section_title": "Statut",
         "status_help": (
             "En un coup d'œil : que se passe-t-il en ce moment ?\n\n"
-            "- **Statut de l'accès distant** — état global : *idle* (rien en cours), "
-            "*pre_authorized* (pré-autorisation active) ou *session_active* "
+            "- **Statut de l'accès distant** — état global : *Inactif* (rien en cours), "
+            "*Pré-autorisé* (pré-autorisation active) ou *Session active* "
             "(maintenance en cours).\n"
             "- **Tunnel actif** — *Oui* dès que votre équipe est connectée.\n"
             "- **État de la connexion** — connexion du plugin au serveur Fleet "
-            "Manager. Devrait normalement être *connected*.\n"
+            "Manager. Devrait normalement être *Connecté*.\n"
             "- **Expiration de la pré-autorisation** / **Fin de la session active** "
             "— moments auxquels une pré-autorisation ou une session en cours se "
             "termine automatiquement."
+            "\n- Avec une pré-autorisation **sans date d'expiration**, *Expiration "
+            "de la pré-autorisation* reste vide ; la mention *Autorisé en "
+            "permanence* apparaît à la place."
         ),
         "control_section_title": "Pré-autorisation (commandes)",
         "control_help": (
@@ -394,6 +472,18 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "session de maintenance peut durer au maximum — p. ex. 4 h).\n\n"
             "Désactivez à nouveau la pré-autorisation dès que vous n'en avez plus "
             "besoin ; vous gardez ainsi le contrôle total."
+            "\n\n**Validité sans date d'expiration** : la pré-autorisation reste valable "
+            "jusqu'à ce que vous la désactiviez, au lieu d'expirer après la durée "
+            "de validité. Prévu pour les installations que votre équipe suit en "
+            "permanence. Chaque session reste limitée à la durée max. de session, "
+            "et Home Assistant vous la rappelle tous les 30 jours. L'interrupteur "
+            "s'applique la prochaine fois que vous activez la pré-autorisation ; "
+            "une pré-autorisation en cours reste inchangée."
+        ),
+        "unlimited_card": (
+            "**Autorisé en permanence** : la pré-autorisation est valable jusqu'à "
+            "sa révocation. Chaque session reste limitée à la durée max. de "
+            "session."
         ),
         "action_section_title": "Actions",
         "action_help": (
@@ -411,6 +501,7 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "preauth_expires_at": "Expiration de la pré-autorisation",
             "session_ends_at": "Fin de la session active",
             "pre_authorization": "Pré-autorisation",
+            "preauth_unlimited": "Validité sans date d'expiration",
             "preauth_validity": "Durée de validité",
             "preauth_max_duration": "Durée max. de session",
             "close_tunnel": "Fermer le tunnel",
@@ -444,14 +535,17 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
         "status_section_title": "Stanje",
         "status_help": (
             "Na prvi pogled: što se trenutačno događa?\n\n"
-            "- **Stanje daljinskog pristupa** — ukupno stanje: *idle* (ništa nije u "
-            "tijeku), *pre_authorized* (predodobrenje aktivno) ili *session_active* "
+            "- **Stanje daljinskog pristupa** — ukupno stanje: *Neaktivno* (ništa nije u "
+            "tijeku), *Predodobreno* (predodobrenje aktivno) ili *Sesija aktivna* "
             "(održavanje u tijeku).\n"
             "- **Tunel aktivan** — *Da* čim je vaš tim povezan.\n"
             "- **Stanje veze** — veza dodatka s Fleet Manager poslužiteljem. "
-            "Uobičajeno bi trebala biti *connected*.\n"
+            "Uobičajeno bi trebala biti *Povezano*.\n"
             "- **Predodobrenje istječe** / **Aktivna sesija završava** — trenuci u "
             "kojima predodobrenje ili sesija u tijeku automatski završava."
+            "\n- Kod predodobrenja **bez datuma isteka** polje *Predodobrenje "
+            "istječe* ostaje prazno; umjesto toga pojavljuje se napomena *Trajno "
+            "odobreno*."
         ),
         "control_section_title": "Predodobrenje (upravljanje)",
         "control_help": (
@@ -465,6 +559,17 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "jedna sesija održavanja — npr. 4 h).\n\n"
             "Isključite predodobrenje čim vam više ne treba — tako zadržavate punu "
             "kontrolu."
+            "\n\n**Valjanost bez datuma isteka** — predodobrenje vrijedi dok ga ne isključiš, "
+            "umjesto da istekne nakon trajanja valjanosti. Namijenjeno "
+            "instalacijama o kojima tvoj tim trajno brine. Svaka pojedinačna "
+            "sesija i dalje je ograničena maks. trajanjem sesije, a Home "
+            "Assistant te podsjeća na predodobrenje svakih 30 dana. Prekidač "
+            "djeluje pri sljedećem uključivanju predodobrenja; aktivno "
+            "predodobrenje ostaje nepromijenjeno."
+        ),
+        "unlimited_card": (
+            "**Trajno odobreno** — predodobrenje vrijedi do opoziva. Svaka "
+            "pojedinačna sesija i dalje je ograničena maks. trajanjem sesije."
         ),
         "action_section_title": "Radnje",
         "action_help": (
@@ -481,6 +586,7 @@ _DASHBOARD_TEXTS: dict[str, dict[str, Any]] = {
             "preauth_expires_at": "Predodobrenje istječe",
             "session_ends_at": "Aktivna sesija završava",
             "pre_authorization": "Predodobrenje",
+            "preauth_unlimited": "Valjanost bez datuma isteka",
             "preauth_validity": "Trajanje valjanosti",
             "preauth_max_duration": "Maks. trajanje sesije",
             "close_tunnel": "Prekini tunel",
@@ -573,6 +679,9 @@ def build_dashboard_config(
             ("session_ends_at", tiles_dict["session_ends_at"], "mdi:timer-sand"),
         ],
     )
+    unlimited_card = _unlimited_card(entity_ids, t["unlimited_card"])
+    if unlimited_card is not None:
+        status_tiles.append(unlimited_card)
     if status_tiles:
         sections.append(
             _section(t["status_section_title"], t["status_help"], status_tiles)
@@ -582,6 +691,7 @@ def build_dashboard_config(
         entity_ids,
         [
             ("pre_authorization", tiles_dict["pre_authorization"], "mdi:shield-key"),
+            ("preauth_unlimited", tiles_dict["preauth_unlimited"], "mdi:infinity"),
             ("preauth_validity", tiles_dict["preauth_validity"], "mdi:clock-outline"),
             ("preauth_max_duration", tiles_dict["preauth_max_duration"], "mdi:timer-cog"),
         ],
@@ -686,6 +796,32 @@ def _tiles(
     return out
 
 
+def _unlimited_card(
+    entity_ids: dict[str, str | None], content: str
+) -> dict[str, Any] | None:
+    """Bedingte Karte „Dauerhaft freigegeben" (#167) für die Status-Sektion.
+
+    Ohne sie sähe der Endkunde bei einer dauerhaften Freigabe nur „Unbekannt" am
+    Ablauf-Sensor. Bedingung: Vorab-Freigabe an **und** Ablauf-Sensor ohne Wert —
+    genau dann ist die laufende Freigabe dauerhaft. Bewusst nicht der Switch
+    „Gültigkeit ohne Ablaufdatum": der gilt erst für das nächste Erteilen und wäre auch bei
+    einer noch laufenden befristeten Freigabe an.
+    """
+    switch_id = entity_ids.get("pre_authorization")
+    expires_id = entity_ids.get("preauth_expires_at")
+    if not switch_id or not expires_id:
+        return None
+    return {
+        "type": "conditional",
+        "conditions": [
+            {"condition": "state", "entity": switch_id, "state": "on"},
+            {"condition": "state", "entity": expires_id, "state": "unknown"},
+        ],
+        "card": {"type": "markdown", "content": content},
+        "grid_options": {"columns": "full"},
+    }
+
+
 # --------------------------------------------------------- entity-Aufloesung
 
 
@@ -741,12 +877,16 @@ async def async_ensure_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
     Ablauf:
     1. Store laden. Wenn ``created: True``:
-       - Falls unser ``url_path`` schon in ``LovelaceData.dashboards`` — fertig.
+       - Falls unser ``url_path`` schon in ``LovelaceData.dashboards`` — nichts
+         einhängen.
        - Sonst (HA-Neustart, leere LovelaceData): unsere ``LovelaceStorage``
          mit der gemerkten ``dashboard_id`` wieder einhaengen + Panel
          registrieren. Karten sind im ``lovelace.<dashboard_id>``-Store
          bereits vorhanden → nicht ueberschreiben. Sprache aus Flag, Default
          ``LEGACY_FLAG_LANGUAGE`` falls Bestands-Flag.
+       - In beiden Fällen: ist ``template_version`` veraltet, unverändertes
+         Dashboard aktualisieren bzw. Repair-Issue anlegen (#204,
+         ``_async_update_if_outdated``).
     2. Sonst (frisch):
        - Sprache aus ``hass.config.language`` ableiten.
        - Falls unser ``url_path`` schon in ``LovelaceData.dashboards`` (Kunde
@@ -777,11 +917,9 @@ async def async_ensure_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
         _LOGGER.warning("LovelaceData.dashboards nicht vorhanden — ueberspringe")
         return
 
-    # 1. Bereits angelegt? Dann nur sicherstellen, dass es in LovelaceData haengt.
+    # 1. Bereits angelegt? Sicherstellen, dass es in LovelaceData hängt, und
+    #    nach einem Plugin-Update ggf. aktualisieren (#204).
     if isinstance(flag, dict) and flag.get("created"):
-        if DASHBOARD_URL_PATH in dashboards:
-            _LOGGER.debug("Fernwartungs-Dashboard bereits in LovelaceData — nichts zu tun")
-            return
         dashboard_id = flag.get("dashboard_id")
         if not dashboard_id:
             # Fremd-Dashboard wurde frueher respektiert — nichts neues anlegen.
@@ -789,13 +927,20 @@ async def async_ensure_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
                 "Flag gesetzt ohne dashboard_id (Fremd-Dashboard respektiert) — nichts zu tun"
             )
             return
-        # HA-Neustart: unsere LovelaceStorage wieder einhaengen — Sprache aus Flag.
-        lang = flag.get("language") or LEGACY_FLAG_LANGUAGE
-        if lang not in SUPPORTED_LANGUAGES:
-            lang = DEFAULT_LANGUAGE
-        _attach_storage_and_panel(
-            hass, dashboards, dashboard_id, initial_config=None, lang=lang
-        )
+        lang = _lang_from_flag(flag)
+        if DASHBOARD_URL_PATH not in dashboards:
+            # HA-Neustart: unsere LovelaceStorage wieder einhaengen — Sprache aus Flag.
+            _attach_storage_and_panel(
+                hass, dashboards, dashboard_id, initial_config=None, lang=lang
+            )
+        else:
+            _LOGGER.debug("Fernwartungs-Dashboard bereits in LovelaceData")
+        try:
+            await _async_update_if_outdated(
+                hass, entry, store, flag, dashboards, dashboard_id, lang
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Aktualisierung des Fernwartungs-Dashboards fehlgeschlagen")
         return
 
     # 2. Frisch — Sprache aus dem ConfigEntry lesen (Endkunden-Wahl im Config-Flow).
@@ -808,7 +953,7 @@ async def async_ensure_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
             "Dashboard '%s' existiert bereits — ueberschreibe nicht, setze nur Flag",
             DASHBOARD_URL_PATH,
         )
-        await _mark_created(store, dashboard_id=None, language=lang)
+        await _mark_created(store, dashboard_id=None, language=lang, config_hash=None)
         return
 
     # 2b. Frisch anlegen.
@@ -826,13 +971,206 @@ async def async_ensure_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
         )
         return
 
-    await _mark_created(store, dashboard_id=dashboard_id, language=lang)
+    await _mark_created(
+        store,
+        dashboard_id=dashboard_id,
+        language=lang,
+        config_hash=config_hash(config),
+    )
     _LOGGER.info(
         "Fernwartungs-Dashboard '%s' angelegt (id=%s, lang=%s)",
         DASHBOARD_URL_PATH,
         dashboard_id,
         lang,
     )
+
+
+async def async_reset_dashboard(hass: HomeAssistant, entry_id: str) -> bool:
+    """Fix-Flow „Zurücksetzen" (#204): aktuelle Standard-Config schreiben.
+
+    Eigene Anpassungen am Fernwartungs-Dashboard gehen dabei verloren — der
+    Fix-Flow weist darauf hin. Liefert ``False``, wenn das eigene Dashboard
+    nicht (mehr) erreichbar ist.
+    """
+    store = _dashboard_store(hass)
+    found = await _async_own_dashboard(hass, store)
+    if found is None:
+        return False
+    flag, storage_obj = found
+    try:
+        await _async_write_current_config(
+            hass, entry_id, store, storage_obj, flag["dashboard_id"], _lang_from_flag(flag)
+        )
+    except Exception:  # noqa: BLE001 — Fix-Flow bricht sauber ab statt „Unbekannter Fehler"
+        _LOGGER.exception("Konnte Fernwartungs-Dashboard nicht zurücksetzen")
+        return False
+    _delete_outdated_issue(hass)
+    _LOGGER.info("Fernwartungs-Dashboard auf Wunsch des Nutzers zurückgesetzt")
+    return True
+
+
+async def async_keep_dashboard(hass: HomeAssistant) -> bool:
+    """Fix-Flow „Behalten" (#204): angepasstes Dashboard stehen lassen.
+
+    Das Flag bekommt die aktuelle Template-Version, aber **keinen** Hash: Das
+    Dashboard gehört jetzt erkennbar dem Kunden. Beim nächsten Template-Bump
+    kommt deshalb wieder das Issue statt einer stillen Aktualisierung — mit dem
+    Hash der angepassten Config würde sie als „unverändert" gelten und
+    überschrieben.
+    """
+    store = _dashboard_store(hass)
+    found = await _async_own_dashboard(hass, store)
+    if found is None:
+        return False
+    flag, _storage_obj = found
+    await _mark_created(
+        store,
+        dashboard_id=flag["dashboard_id"],
+        language=_lang_from_flag(flag),
+        config_hash=None,
+    )
+    _delete_outdated_issue(hass)
+    return True
+
+
+def config_hash(config: dict[str, Any]) -> str:
+    """SHA-256 über die kanonische JSON-Form der Karten-Config (#204).
+
+    ``sort_keys`` macht den Hash unabhängig von der Schlüssel-Reihenfolge,
+    die HA beim Speichern im Storage nicht garantiert.
+    """
+    canonical = json.dumps(
+        config, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _lang_from_flag(flag: dict[str, Any]) -> str:
+    """Sprache des bestehenden Dashboards laut Flag (Bestand ohne Feld: Deutsch)."""
+    lang = flag.get("language") or LEGACY_FLAG_LANGUAGE
+    return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+
+async def _async_update_if_outdated(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    store: Store,
+    flag: dict[str, Any],
+    dashboards: dict[str, Any],
+    dashboard_id: str,
+    lang: str,
+) -> None:
+    """Aktualisiert ein unverändertes Dashboard nach einem Template-Bump (#204).
+
+    Angepasst oder unbekannt (kein ``config_hash`` im Flag, Bestand vor #204)
+    → nichts schreiben, Repair-Issue anlegen. ``template_version`` bleibt dann
+    alt, damit das nicht-persistente Issue nach einem Neustart wiederkommt.
+    """
+    version = flag.get("template_version")
+    if isinstance(version, int) and version >= DASHBOARD_TEMPLATE_VERSION:
+        return
+
+    storage_obj = _own_storage(dashboards, dashboard_id)
+    if storage_obj is None:
+        _LOGGER.warning(
+            "Dashboard '%s' gehört nicht (mehr) dem Plugin — keine Aktualisierung",
+            DASHBOARD_URL_PATH,
+        )
+        return
+
+    stored = await _async_load_stored_config(storage_obj)
+    saved_hash = flag.get("config_hash")
+    if stored is None or (saved_hash and config_hash(stored) == saved_hash):
+        await _async_write_current_config(
+            hass, entry.entry_id, store, storage_obj, dashboard_id, lang
+        )
+        _LOGGER.info(
+            "Fernwartungs-Dashboard von Template-Version %s auf %s aktualisiert",
+            version,
+            DASHBOARD_TEMPLATE_VERSION,
+        )
+        return
+
+    _LOGGER.info(
+        "Fernwartungs-Dashboard wurde angepasst oder stammt von vor #204 — "
+        "keine automatische Aktualisierung, Repair-Issue angelegt"
+    )
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        DASHBOARD_OUTDATED_ISSUE_ID,
+        is_fixable=True,
+        is_persistent=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=DASHBOARD_OUTDATED_ISSUE_ID,
+        data={"entry_id": entry.entry_id},
+    )
+
+
+async def _async_write_current_config(
+    hass: HomeAssistant,
+    entry_id: str,
+    store: Store,
+    storage_obj: Any,
+    dashboard_id: str,
+    lang: str,
+) -> None:
+    """Schreibt die aktuelle Standard-Config und merkt sich Version und Hash."""
+    config = build_dashboard_config(_resolve_entity_ids(hass, entry_id), lang)
+    await storage_obj.async_save(config)
+    await _mark_created(
+        store,
+        dashboard_id=dashboard_id,
+        language=lang,
+        config_hash=config_hash(config),
+    )
+
+
+async def _async_own_dashboard(
+    hass: HomeAssistant, store: Store
+) -> tuple[dict[str, Any], Any] | None:
+    """Flag und eingehängte ``LovelaceStorage`` des eigenen Dashboards."""
+    try:
+        flag = await store.async_load()
+    except Exception:  # noqa: BLE001 — korrupter Flag-Store: wie „kein Dashboard"
+        _LOGGER.exception("Konnte Dashboard-Flag nicht laden — Fix-Flow bricht ab")
+        return None
+    if not isinstance(flag, dict) or not flag.get("dashboard_id"):
+        return None
+    ld = _lovelace_data(hass)
+    dashboards = _lovelace_dashboards(ld) if ld is not None else None
+    if dashboards is None:
+        return None
+    storage_obj = _own_storage(dashboards, flag["dashboard_id"])
+    if storage_obj is None:
+        return None
+    return flag, storage_obj
+
+
+def _own_storage(dashboards: dict[str, Any], dashboard_id: str) -> Any | None:
+    """Die unter unserem ``url_path`` hängende Storage — nur, wenn sie uns gehört."""
+    storage_obj = dashboards.get(DASHBOARD_URL_PATH)
+    item = getattr(storage_obj, "config", None)
+    if not isinstance(item, dict) or item.get("id") != dashboard_id:
+        return None
+    return storage_obj
+
+
+async def _async_load_stored_config(storage_obj: Any) -> dict[str, Any] | None:
+    """Gespeicherte Karten-Config; ``None``, wenn der Store noch leer ist."""
+    from homeassistant.components.lovelace.const import ConfigNotFound
+
+    try:
+        return await storage_obj.async_load(False)
+    except ConfigNotFound:
+        return None
+
+
+def _delete_outdated_issue(hass: HomeAssistant) -> None:
+    try:
+        ir.async_delete_issue(hass, DOMAIN, DASHBOARD_OUTDATED_ISSUE_ID)
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Konnte Issue '%s' nicht entfernen", DASHBOARD_OUTDATED_ISSUE_ID, exc_info=True)
 
 
 async def async_remove_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -871,6 +1209,7 @@ async def async_remove_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
             )
 
     await _clear_flag(store)
+    _delete_outdated_issue(hass)
     if isinstance(flag, dict) and flag.get("dashboard_id"):
         _LOGGER.info(
             "Fernwartungs-Dashboard '%s' entfernt (id=%s)",
@@ -970,7 +1309,11 @@ def _remove_panel(hass: HomeAssistant) -> None:
 
 
 async def _mark_created(
-    store: Store, *, dashboard_id: str | None, language: str
+    store: Store,
+    *,
+    dashboard_id: str | None,
+    language: str,
+    config_hash: str | None,
 ) -> None:
     try:
         await store.async_save(
@@ -980,6 +1323,7 @@ async def _mark_created(
                 "dashboard_id": dashboard_id,
                 "template_version": DASHBOARD_TEMPLATE_VERSION,
                 "language": language,
+                "config_hash": config_hash,
             }
         )
     except Exception:  # noqa: BLE001

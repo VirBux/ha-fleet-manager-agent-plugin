@@ -306,7 +306,9 @@ class IntegratorUserManager:
             await self._hass.auth.async_update_user(user, is_active=False)
             _LOGGER.debug("Wartungs-User deaktiviert (fail-closed)")
 
-    async def async_activate(self) -> IntegratorCredentials | None:
+    async def async_activate(
+        self, *, remove_stale_tokens: bool = True
+    ) -> IntegratorCredentials | None:
         """Session-Start: Passwort rotieren (Phase 2), User aktivieren, Credentials liefern.
 
         Rueckgabe: die aktiven Credentials (mit frischem Passwort) oder — wenn der
@@ -333,6 +335,14 @@ class IntegratorUserManager:
                 error="user_missing",
             )
             return self._credentials
+
+        # Alte Refresh-Tokens vor dem Scharfschalten entfernen (#165): Eine Session,
+        # die ohne async_deactivate endete (Absturz, verworfene Session), hinterlässt
+        # Tokens, die mit dem Aktivieren wieder gültig würden und die Passwort-Rotation
+        # umgingen. Ausnahme: das Fortsetzen derselben Session nach einem HA-Neustart —
+        # deren Tokens gehören zum noch offenen Integrator-Browser und bleiben.
+        if remove_stale_tokens:
+            await self._remove_refresh_tokens(user)
 
         # Phase 2 — Passwort pro Session rotieren: ein evtl. frueher geleaktes
         # Passwort ist nach Session-Ende wertlos. Bei einem Provider-Problem
@@ -364,6 +374,16 @@ class IntegratorUserManager:
         _LOGGER.info("Wartungs-User aktiviert + Passwort rotiert (Session-Start)")
         return self._credentials
 
+    async def _remove_refresh_tokens(self, user: Any) -> None:
+        """Entfernt alle Refresh-Tokens des Wartungs-Users (best-effort)."""
+        for token in list(getattr(user, "refresh_tokens", {}).values()):
+            try:
+                await self._hass.auth.async_remove_refresh_token(token)
+            except Exception:  # noqa: BLE001 — Best-effort Token-Cleanup
+                _LOGGER.debug(
+                    "Refresh-Token konnte nicht entfernt werden", exc_info=True
+                )
+
     async def async_deactivate(self) -> None:
         """Session-Ende: alle Refresh-Tokens des Users entfernen + ``is_active=False``.
 
@@ -383,13 +403,7 @@ class IntegratorUserManager:
             )
             return
 
-        for token in list(getattr(user, "refresh_tokens", {}).values()):
-            try:
-                await self._hass.auth.async_remove_refresh_token(token)
-            except Exception:  # noqa: BLE001 — Best-effort Token-Cleanup
-                _LOGGER.debug(
-                    "Refresh-Token konnte nicht entfernt werden", exc_info=True
-                )
+        await self._remove_refresh_tokens(user)
 
         if getattr(user, "is_active", False):
             await self._hass.auth.async_update_user(user, is_active=False)

@@ -29,7 +29,10 @@ Shutdown:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -48,13 +51,19 @@ from .const import (
     DATA_DEVICE_INFO,
     DATA_REMOTE_ACCESS,
     DOMAIN,
+    MAX_PREAUTH_VALIDITY_HOURS,
+    MAX_SESSION_HOURS,
+    REBUILD_BACKOFF_BASE_SECONDS,
+    REBUILD_BACKOFF_MAX_SECONDS,
+    REBUILD_SETTLE_SECONDS,
 )
+from .backup_handler import BackupRequestHandler
 from .clear_logs_handler import ClearLogsHandler
-from .dashboard import async_ensure_dashboard, async_remove_dashboard
+from .dashboard import _lang_from_entry, async_ensure_dashboard, async_remove_dashboard
 from .device import build_device_info
 from .integrator_user import IntegratorUserManager
 from .reconnect import TunnelReconnector
-from .remote_access import RemoteAccessManager
+from .remote_access import RemoteAccessManager, parse_iso_utc
 from .request_poller import RequestPoller
 from .restart_handler import RestartHandler
 from .state_reporter import StateReporter
@@ -70,6 +79,7 @@ DATA_REQUEST_POLLER = "request_poller"
 DATA_UPDATE_HANDLER = "update_handler"
 DATA_CLEAR_LOGS_HANDLER = "clear_logs_handler"
 DATA_RESTART_HANDLER = "restart_handler"
+DATA_BACKUP_HANDLER = "backup_handler"
 DATA_RECONNECTOR = "reconnector"
 DATA_HTTP_SESSION = "http_session"
 
@@ -91,14 +101,18 @@ SERVICE_REVOKE_PREAUTH = "revoke_pre_authorization"
 SERVICE_CONFIRM_REQUEST = "confirm_request"
 SERVICE_CLOSE_TUNNEL = "close_tunnel"
 
+# Ohne ``expires_in_hours`` gilt die persistierte Gültigkeitsdauer, ohne ``unlimited``
+# der Switch „Gültigkeit ohne Ablaufdatum" (#167). Die Sitzungsdauer reicht wie an der Number und
+# im Backend bis 720 h (#166; vorher hier 12 h).
 GRANT_PREAUTH_SCHEMA = vol.Schema(
     {
-        vol.Required("expires_in_hours"): vol.All(
-            vol.Coerce(float), vol.Range(min=0.1, max=168)
+        vol.Optional("expires_in_hours"): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1, max=MAX_PREAUTH_VALIDITY_HOURS)
         ),
         vol.Optional("max_duration_hours"): vol.All(
-            vol.Coerce(int), vol.Range(min=1, max=12)
+            vol.Coerce(int), vol.Range(min=1, max=MAX_SESSION_HOURS)
         ),
+        vol.Optional("unlimited"): cv.boolean,
     }
 )
 
@@ -138,8 +152,9 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         if manager is None:
             return
         await manager.grant_pre_authorization(
-            expires_in_hours=call.data["expires_in_hours"],
+            expires_in_hours=call.data.get("expires_in_hours"),
             max_duration_hours=call.data.get("max_duration_hours"),
+            unlimited=call.data.get("unlimited"),
         )
 
     async def _revoke_preauth(call: ServiceCall) -> None:
@@ -214,8 +229,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         backend_url=backend_url,
         api_key=api_key,
         integrator_user=integrator_user,
+        language=_lang_from_entry(entry, hass),
     )
     await remote_access.async_load()
+    # Erinnerung an eine dauerhafte Vorab-Freigabe (#167): täglicher Check.
+    remote_access.async_start_reminder()
 
     async def _on_tunnel_closed() -> None:
         await remote_access.async_end_session(reason="tunnel_closed")
@@ -264,6 +282,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         on_give_up=_reconnect_gave_up,
     )
     tunnel_forwarder.set_reconnect_callback(reconnector.trigger)
+    # Session-Ende im Plugin (Ablauf, Ablehnung, Unload) schließt den Tunnel (#165).
+    remote_access.set_session_end_callback(tunnel_forwarder.async_close_tunnel)
 
     # Action-Handler beim Poller registrieren
     request_poller.register_handler(
@@ -278,6 +298,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Self-Healing-Handler (#90): raeumt verwaiste Repair-Issues, sobald der Poll
     # "nichts offen" (HTTP 204 → synthetische "idle"-Aktion) meldet.
     request_poller.register_handler("idle", remote_access._on_poll_idle)
+
+    # Abgleich der Vorab-Freigabe (#167): Jede Poll-Antwort trägt die Backend-Sicht.
+    request_poller.add_response_listener(remote_access.async_on_poll_response)
     # Update-Befehle (#103): das Backend liefert in ruhigen Ticks (keine
     # Connection-Action offen) die Action "update_batch" mit allen offenen
     # Update-Commands; der Handler arbeitet sie sequenziell via update.install ab.
@@ -307,6 +330,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         api_key=api_key,
     )
     request_poller.register_handler("restart", restart_handler.handle)
+    # Backup auf Knopfdruck (#168): das Backend liefert direkt nach den Update-Befehlen
+    # die Action "backup_create". Der Handler erzeugt das Backup verschlüsselt über den
+    # Backup-Manager von HA, lädt es in Stücken hoch und löscht es danach lokal. Sein
+    # Zustand überlebt HA-Neustarts; nach dem Start setzt er einen Upload fort.
+    backup_handler = BackupRequestHandler(
+        hass,
+        entry.entry_id,
+        session=http_session,
+        backend_url=backend_url,
+        api_key=api_key,
+        language=_lang_from_entry(entry, hass),
+    )
+    await backup_handler.async_setup()
+    request_poller.register_handler("backup_create", backup_handler.handle)
 
     hass.data[DOMAIN][entry.entry_id] = {
         CONF_API_KEY: api_key,
@@ -322,6 +359,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_UPDATE_HANDLER: update_handler,
         DATA_CLEAR_LOGS_HANDLER: clear_logs_handler,
         DATA_RESTART_HANDLER: restart_handler,
+        DATA_BACKUP_HANDLER: backup_handler,
         DATA_DEVICE_INFO: build_device_info(entry.entry_id, backend_url),
     }
 
@@ -358,6 +396,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+@dataclass
+class _RebuildBackoff:
+    """Zählt Neuaufbauten derselben Anfrage und bremst sie exponentiell (#165).
+
+    Der erste Neuaufbau läuft sofort, danach mindestens 15 s, 30 s, 60 s … bis
+    5 min Pause. Eine andere requestId setzt den Zähler zurück.
+    """
+
+    request_id: str | None = None
+    count: int = 0
+    last: float = 0.0
+
+    def wait_remaining(self, request_id: str, now: float) -> float:
+        """Verbleibende Pause in Sekunden (0 = Neuaufbau erlaubt)."""
+        if request_id != self.request_id or self.count == 0:
+            return 0.0
+        if now - self.last > 2 * REBUILD_BACKOFF_MAX_SECONDS:
+            # Lange kein Neuaufbau nötig: Der Tunnel lief — späterer Bedarf (etwa
+            # nach einem Backend-Neustart) beginnt wieder bei der ersten Stufe.
+            self.count = 0
+            return 0.0
+        wait_s = min(
+            REBUILD_BACKOFF_MAX_SECONDS,
+            REBUILD_BACKOFF_BASE_SECONDS * 2 ** (self.count - 1),
+        )
+        return max(0.0, wait_s - (now - self.last))
+
+    def record_attempt(self, request_id: str, now: float) -> int:
+        """Vermerkt einen Neuaufbau und liefert seine laufende Nummer."""
+        if request_id != self.request_id:
+            self.request_id, self.count = request_id, 0
+        self.count += 1
+        self.last = now
+        return self.count
+
+    def mark_done(self, now: float) -> None:
+        """Pause ab dem Abbau des alten Tunnels messen, nicht ab dem Poll-Eingang —
+        sonst würde die erste 15-s-Stufe wegen der Poll-Latenz oft zu 30 s."""
+        self.last = now
+
+
 def _make_connection_accepted_handler(
     hass: HomeAssistant,
     entry_id: str,
@@ -365,6 +444,9 @@ def _make_connection_accepted_handler(
     tunnel_forwarder: TunnelForwarder,
     relay_url: str,
     remote_access: RemoteAccessManager,
+    *,
+    rebuild_settle_s: float = REBUILD_SETTLE_SECONDS,
+    monotonic: Any = time.monotonic,
 ) -> Any:
     """Erzeugt den Handler für die 'connection_accepted'-Aktion.
 
@@ -373,16 +455,20 @@ def _make_connection_accepted_handler(
 
     Ablauf bei connection_accepted:
     1. tunnelToken und connectorUrl aus der Poll-Antwort lesen
-    2. TunnelForwarder bekommt den Token (für X-Tunnel-Token beim Credentials-POST)
-    3. ws_client.connect_for_tunnel(token, url) — baut WS zum Connector auf
+    2. Freigabe prüfen und Wartungs-Session sicherstellen — auch wenn das Plugin
+       die Annahme nicht selbst ausgelöst hat (Vorab-Freigabe, HA-Neustart).
+       Ohne lokale Freigabe muss der Endkunde bestätigen (#165).
+    3. TunnelForwarder bekommt den Token (für X-Tunnel-Token beim Credentials-POST)
+    4. ws_client.connect_for_tunnel(token, url) — baut WS zum Connector auf
        (tunnel_open-Handler im TunnelForwarder wird danach vom WS-Client gefeuert)
     """
 
-    async def _handler(data: dict[str, Any]) -> None:
-        # Self-Healing (#90): Hat eine Vorab-Freigabe die Anfrage ohne Endkunden-
-        # Klick akzeptiert, kann noch ein Repair-Issue offenstehen — aufraeumen.
-        await remote_access._on_poll_idle()
+    # Neuaufbau-Bremse (#165): Kommen die Zugangsdaten dauerhaft nicht an (POST
+    # scheitert, Wartungs-User gesperrt), soll nicht alle 15 s ein Tunnel fallen
+    # und neu entstehen.
+    rebuild = _RebuildBackoff()
 
+    async def _handler(data: dict[str, Any]) -> None:
         # requestId der Anfrage (camelCase vom Backend; snake_case-Fallback für Tests).
         request_id: str = data.get("requestId") or data.get("request_id") or ""
         tunnel_token: str = data.get("tunnelToken") or data.get("tunnel_token") or ""
@@ -410,36 +496,89 @@ def _make_connection_accepted_handler(
             )
             return
 
-        # Phase A — requestId-bewusste Idempotenz:
-        # Läuft bereits ein Tunnel für GENAU diese Anfrage, ist der Frame ein
-        # Duplikat (z.B. Backend-Neustart mit leerem Tunnel-Cache liefert erneut
-        # einen Token). Dann NICHT neu aufbauen — sonst kappt der Disconnect die
-        # laufende Sitzung ohne Grund.
+        # Wartungs-Session sicherstellen, BEVOR ein Tunnel steht: Bei Vorab-Freigabe
+        # und nach einem HA-Neustart kennt das Plugin die Annahme nur aus diesem
+        # Frame. Fail-closed — ist der Wartungs-User nicht aktivierbar, kein Tunnel.
+        if not await remote_access.async_ensure_session_for_accepted(
+            request_id,
+            subject=data.get("subject") or "",
+            session_expires_at=parse_iso_utc(data.get("sessionExpiresAt")),
+        ):
+            # Keine Freigabe (beendete Anfrage, Rückfrage offen, Uhr geht vor). Steht
+            # für genau diese Anfrage noch eine Tunnel-WS, schließen (#165).
+            if ws_client.is_connected and request_id == tunnel_forwarder.active_request_id:
+                await tunnel_forwarder.async_close_tunnel()
+            return
+
+        def _session_open() -> bool:
+            # Endet die Session während der folgenden Awaits (Ablauf, Ablehnung,
+            # Trennen, Unload), ist async_close_tunnel ein No-op, solange die WS noch
+            # nicht steht — der Handler darf dann nicht (weiter) verbinden (#165).
+            session = remote_access.session
+            return session is not None and session.request_id == request_id
+
         if ws_client.is_connected:
             if request_id and request_id == tunnel_forwarder.active_request_id:
-                _LOGGER.debug(
-                    "connection_accepted für bereits laufenden Tunnel "
-                    "(request=%s) — ignoriert",
+                # Erneutes connection_accepted für die LAUFENDE Anfrage: Das Backend
+                # gibt nur dann einen Token aus, wenn es keinen Live-Tunnel für sie
+                # kennt — die Zugangsdaten sind nie angekommen (z.B. Wartungs-User
+                # war deaktiviert) oder der Backend-Cache ist nach einem Neustart
+                # leer. Früher wurde der Frame hier ignoriert; dann blieb dieser
+                # Zustand dauerhaft hängen („Session aktiv, keine Live-Verbindung",
+                # alle 15 s ein neuer Token). Stattdessen neu aufbauen: Der stabile
+                # Slug hält die Tunnel-URL gleich, tunnel_open postet die
+                # Zugangsdaten mit dem frischen Token.
+                wait_s = rebuild.wait_remaining(request_id, monotonic())
+                if wait_s > 0:
+                    _LOGGER.debug(
+                        "Neuaufbau für request=%s gebremst (noch %.0f s Pause)",
+                        request_id,
+                        wait_s,
+                    )
+                    return
+                attempt = rebuild.record_attempt(request_id, monotonic())
+                _LOGGER.info(
+                    "Backend kennt den laufenden Tunnel nicht (request=%s) — "
+                    "Tunnel wird neu aufgebaut (%d. Versuch)",
                     request_id,
+                    attempt,
                 )
-                return
-            # Andere requestId → echte neue Anfrage: alte WS erst sauber schließen,
-            # damit der Forwarder DELETE-Credentials für den alten Slug feuert und
-            # das Backend den alten ConnectionRequest auf CLOSED setzt. Erst DANACH
-            # den neuen Zustand setzen — der Disconnect-Callback würde ihn sonst
-            # sofort wieder zurücksetzen.
-            # Handover markieren (#108 Phase C): der alte Tunnel-Close darf WEDER
-            # die (bereits neue) Wartungs-Session beenden NOCH einen Reconnect
-            # auslösen — diesen Aufbau übernehmen wir gleich selbst.
-            _LOGGER.info(
-                "Neue Verbindungsanfrage — bestehende Tunnel-WS wird zuerst geschlossen"
-            )
-            tunnel_forwarder.mark_handover_close()
-            await ws_client.disconnect()
+                tunnel_forwarder.mark_rebuild_close()
+                await ws_client.disconnect()
+                rebuild.mark_done(monotonic())
+                # Gleicher Slug: Der Close-Notify des alten Tunnels muss beim Backend
+                # sein, bevor der neue seine Zugangsdaten postet — er matcht nur über
+                # den Slug und würde sonst den Cache-Eintrag des neuen Tunnels
+                # abräumen. Die Pause gibt auch dem Connector Zeit, den Slug
+                # freizugeben (sonst würfelt er einen neuen, die URL wechselt).
+                if rebuild_settle_s > 0:
+                    await asyncio.sleep(rebuild_settle_s)
+            else:
+                # Andere requestId → echte neue Anfrage: alte WS erst sauber schließen,
+                # damit der Forwarder DELETE-Credentials für den alten Slug feuert und
+                # das Backend den alten ConnectionRequest auf CLOSED setzt. Erst DANACH
+                # den neuen Zustand setzen — der Disconnect-Callback würde ihn sonst
+                # sofort wieder zurücksetzen.
+                # Handover markieren (#108 Phase C): der alte Tunnel-Close darf WEDER
+                # die (bereits neue) Wartungs-Session beenden NOCH einen Reconnect
+                # auslösen — diesen Aufbau übernehmen wir gleich selbst.
+                _LOGGER.info(
+                    "Neue Verbindungsanfrage — bestehende Tunnel-WS wird zuerst geschlossen"
+                )
+                tunnel_forwarder.mark_handover_close()
+                await ws_client.disconnect()
 
         # Zustand des neuen Tunnels im Forwarder hinterlegen: Token für den
-        # Credentials-POST, requestId für die Idempotenz. Den Slug gibt der Connect
+        # Credentials-POST, requestId für Handover/Neuaufbau. Den Slug gibt der Connect
         # direkt an den Connector weiter (autoritativ wird er dann via tunnel_open).
+        if not _session_open():
+            _LOGGER.info(
+                "Wartungs-Session von request=%s endete während des Tunnel-Aufbaus — "
+                "kein Tunnel",
+                request_id,
+            )
+            return
+
         tunnel_forwarder.set_active_tunnel_token(tunnel_token)
         tunnel_forwarder.set_active_request_id(request_id)
 
@@ -453,6 +592,11 @@ def _make_connection_accepted_handler(
             _LOGGER.exception("Tunnel-WS-Verbindung fehlgeschlagen")
             tunnel_forwarder.set_active_tunnel_token("")
             tunnel_forwarder.set_active_request_id(None)
+            return
+        if not _session_open():
+            # Session endete während des Handshakes → den eben aufgebauten Tunnel
+            # sofort wieder schließen, sonst bliebe er ohne Session offen.
+            await tunnel_forwarder.async_close_tunnel()
 
     return _handler
 
@@ -480,11 +624,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         state_reporter.stop()
     if request_poller is not None:
         request_poller.stop()
+    # Laufenden Backup-Upload anhalten, bevor die HTTP-Session schließt (#168). Der
+    # Auftragszustand bleibt gespeichert; nach dem nächsten Laden setzt er fort.
+    backup_handler: BackupRequestHandler | None = data.get(DATA_BACKUP_HANDLER)
+    if backup_handler is not None:
+        await backup_handler.async_shutdown()
     # Reconnect-Loop stoppen, bevor der Tunnel-Forwarder schließt (sonst könnte ein
     # laufender Loop noch pollen, während alles abgebaut wird) — #108 Phase C.
     if reconnector is not None:
         reconnector.cancel()
     if remote_access is not None:
+        # Unload (Reload, Deaktivieren, Entfernen — nicht der normale HA-Stopp) ist
+        # ein gewolltes Ende: Session beenden statt sie als fortsetzbar liegen zu
+        # lassen. Läuft vor dem Schließen der HTTP-Session, damit der Close ans
+        # Backend durchgeht (#165).
+        await remote_access.async_end_for_unload()
         await remote_access.async_shutdown()
     if tunnel_forwarder is not None:
         await tunnel_forwarder.async_shutdown()

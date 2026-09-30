@@ -35,6 +35,8 @@ from .const import (
     SIGNAL_CONNECTION_STATE,
     SIGNAL_REMOTE_ACCESS_STATE,
     STATUS_IDLE,
+    STATUS_PRE_AUTHORIZED,
+    STATUS_SESSION_ACTIVE,
 )
 
 
@@ -69,6 +71,10 @@ class FleetConnectionSensor(SensorEntity):
     _attr_translation_key = "connection_state"
     _attr_icon = "mdi:cloud-check"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # ENUM mit festen Optionen: HA kennt die möglichen Werte (Attribut
+    # ``options``), die Übersetzungen stehen unter entity.sensor.connection_state.state.
+    _attr_options = ["connected", "disconnected"]
+    _attr_device_class = SensorDeviceClass.ENUM
 
     def __init__(self, entry_id: str, device_info) -> None:
         self._entry_id = entry_id
@@ -125,7 +131,7 @@ class RemoteAccessStatusSensor(_RemoteAccessSensorBase):
 
     _attr_translation_key = "remote_access_status"
     _attr_icon = "mdi:access-point-network"
-    _attr_options = ["idle", "pre_authorized", "session_active"]
+    _attr_options = [STATUS_IDLE, STATUS_PRE_AUTHORIZED, STATUS_SESSION_ACTIVE]
     _attr_device_class = SensorDeviceClass.ENUM
 
     def __init__(self, entry_id: str, remote_access, device_info) -> None:
@@ -138,7 +144,12 @@ class RemoteAccessStatusSensor(_RemoteAccessSensorBase):
 
 
 class PreAuthExpiresSensor(_RemoteAccessSensorBase):
-    """Ablaufzeitpunkt der aktiven Vorab-Freigabe."""
+    """Ablaufzeitpunkt der aktiven Vorab-Freigabe.
+
+    Bei einer dauerhaften Freigabe (#167) ohne Wert (``unknown``) und mit dem
+    Attribut ``unlimited: true`` — der Timestamp-Sensor bleibt, damit bestehende
+    Dashboards und Automationen beim Kunden nicht brechen.
+    """
 
     _attr_translation_key = "preauth_expires_at"
     _attr_icon = "mdi:calendar-clock"
@@ -152,6 +163,13 @@ class PreAuthExpiresSensor(_RemoteAccessSensorBase):
     def native_value(self) -> datetime | None:
         pre_auth = self._remote_access.pre_authorization
         return pre_auth.expires_at if pre_auth else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, bool] | None:
+        pre_auth = self._remote_access.pre_authorization
+        if pre_auth is not None and pre_auth.unlimited:
+            return {"unlimited": True}
+        return None
 
 
 class SessionEndsSensor(_RemoteAccessSensorBase):

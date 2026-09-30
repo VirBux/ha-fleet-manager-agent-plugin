@@ -49,15 +49,42 @@
           "already_resolved": "Diese Anfrage wurde bereits beantwortet."
         }
       }
+    },
+    "dashboard_outdated": {
+      "title": "Fernwartungs-Dashboard ist veraltet",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Fernwartungs-Dashboard aktualisieren",
+            "description": "Diese Version des HA Fleet Manager Agent bringt neue Elemente für das Dashboard **Fernwartung** mit. Das Dashboard wurde nicht automatisch aktualisiert, weil es möglicherweise angepasst wurde.\n\n**Zurücksetzen** ersetzt das Dashboard durch den aktuellen Standard. Eigene Änderungen an diesem Dashboard gehen dabei verloren.\n\n**Behalten** lässt das Dashboard, wie es ist. Du wirst erneut gefragt, wenn ein späteres Update das Dashboard ändert.",
+            "menu_options": {
+              "reset": "Dashboard zurücksetzen",
+              "keep": "Mein Dashboard behalten"
+            }
+          }
+        },
+        "abort": {
+          "dashboard_missing": "Das Fernwartungs-Dashboard wurde nicht gefunden. Starte Home Assistant neu und versuche es noch einmal."
+        }
+      }
     }
   },
   "entity": {
     "sensor": {
       "connection_state": {
-        "name": "Verbindungsstatus"
+        "name": "Verbindungsstatus",
+        "state": {
+          "connected": "Verbunden",
+          "disconnected": "Getrennt"
+        }
       },
       "remote_access_status": {
-        "name": "Fernzugriffs-Status"
+        "name": "Fernzugriffs-Status",
+        "state": {
+          "idle": "Inaktiv",
+          "pre_authorized": "Vorab freigegeben",
+          "session_active": "Sitzung aktiv"
+        }
       },
       "preauth_expires_at": {
         "name": "Vorab-Freigabe läuft ab"
@@ -74,6 +101,9 @@
     "switch": {
       "pre_authorization": {
         "name": "Vorab-Freigabe"
+      },
+      "preauth_unlimited": {
+        "name": "Gültigkeit ohne Ablaufdatum"
       }
     },
     "number": {
@@ -93,15 +123,19 @@
   "services": {
     "grant_pre_authorization": {
       "name": "Vorab-Freigabe erteilen",
-      "description": "Erteilt eine zeitlich befristete Vorab-Freigabe für den Integrator (siehe REQUIREMENTS §4.3). Innerhalb des Zeitfensters kann der Integrator eine Verbindung ohne weitere Rückfrage aufbauen.",
+      "description": "Erteilt eine Vorab-Freigabe für den Integrator (siehe REQUIREMENTS §4.3) — befristet oder ohne Ablaufdatum bis zum Widerruf. Solange sie gilt, kann der Integrator eine Verbindung ohne weitere Rückfrage aufbauen; jede einzelne Sitzung bleibt befristet.",
       "fields": {
         "expires_in_hours": {
           "name": "Gültig für (Stunden)",
-          "description": "Zeitraum, in dem die Vorab-Freigabe aktiv bleibt."
+          "description": "Zeitraum, in dem die Vorab-Freigabe aktiv bleibt. Ohne Angabe gilt die eingestellte Gültigkeitsdauer; bei „Gültigkeit ohne Ablaufdatum“ ohne Wirkung."
         },
         "max_duration_hours": {
           "name": "Maximale Sessiondauer (Stunden)",
           "description": "Maximale Dauer einer einzelnen Fernzugriffs-Session."
+        },
+        "unlimited": {
+          "name": "Gültigkeit ohne Ablaufdatum",
+          "description": "Die Vorab-Freigabe gilt bis zum Widerruf. Ohne Angabe entscheidet der Schalter „Gültigkeit ohne Ablaufdatum“."
         }
       }
     },

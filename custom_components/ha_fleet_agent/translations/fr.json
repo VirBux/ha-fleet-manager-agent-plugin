@@ -49,15 +49,42 @@
           "already_resolved": "Cette demande a déjà reçu une réponse."
         }
       }
+    },
+    "dashboard_outdated": {
+      "title": "Le tableau de bord de maintenance à distance n'est plus à jour",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Mettre à jour le tableau de bord de maintenance à distance",
+            "description": "Cette version de HA Fleet Manager Agent apporte de nouveaux éléments pour le tableau de bord **Maintenance à distance**. Le tableau de bord n'a pas été mis à jour automatiquement, car il a peut-être été personnalisé.\n\n**Réinitialiser** remplace le tableau de bord par la présentation standard actuelle. Vos propres modifications de ce tableau de bord seront perdues.\n\n**Conserver** laisse le tableau de bord tel quel. La question vous sera de nouveau posée lorsqu'une future mise à jour modifiera le tableau de bord.",
+            "menu_options": {
+              "reset": "Réinitialiser le tableau de bord",
+              "keep": "Conserver mon tableau de bord"
+            }
+          }
+        },
+        "abort": {
+          "dashboard_missing": "Le tableau de bord de maintenance à distance est introuvable. Redémarrez Home Assistant et réessayez."
+        }
+      }
     }
   },
   "entity": {
     "sensor": {
       "connection_state": {
-        "name": "État de la connexion"
+        "name": "État de la connexion",
+        "state": {
+          "connected": "Connecté",
+          "disconnected": "Déconnecté"
+        }
       },
       "remote_access_status": {
-        "name": "Statut de l'accès distant"
+        "name": "Statut de l'accès distant",
+        "state": {
+          "idle": "Inactif",
+          "pre_authorized": "Pré-autorisé",
+          "session_active": "Session active"
+        }
       },
       "preauth_expires_at": {
         "name": "Expiration de la pré-autorisation"
@@ -74,6 +101,9 @@
     "switch": {
       "pre_authorization": {
         "name": "Pré-autorisation"
+      },
+      "preauth_unlimited": {
+        "name": "Validité sans date d'expiration"
       }
     },
     "number": {
@@ -93,15 +123,19 @@
   "services": {
     "grant_pre_authorization": {
       "name": "Accorder une pré-autorisation",
-      "description": "Accorde une pré-autorisation de durée limitée à l'intégrateur (voir REQUIREMENTS §4.3). Pendant cette fenêtre, l'intégrateur peut ouvrir une connexion sans confirmation supplémentaire.",
+      "description": "Accorde une pré-autorisation à l'intégrateur (voir REQUIREMENTS §4.3), de durée limitée ou sans date d'expiration jusqu'à révocation. Tant qu'elle est valable, l'intégrateur peut ouvrir une connexion sans confirmation supplémentaire ; chaque session reste limitée.",
       "fields": {
         "expires_in_hours": {
           "name": "Valable pendant (heures)",
-          "description": "Période pendant laquelle la pré-autorisation reste active."
+          "description": "Période pendant laquelle la pré-autorisation reste active. Sans valeur, la durée de validité configurée s'applique ; sans effet avec « Validité sans date d'expiration »."
         },
         "max_duration_hours": {
           "name": "Durée maximale de session (heures)",
           "description": "Durée maximale d'une seule session d'accès distant."
+        },
+        "unlimited": {
+          "name": "Validité sans date d'expiration",
+          "description": "La pré-autorisation est valable jusqu'à sa révocation. Sans valeur, c'est l'interrupteur « Validité sans date d'expiration » qui décide."
         }
       }
     },

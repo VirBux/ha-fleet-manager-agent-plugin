@@ -8,6 +8,11 @@ Der Flow zeigt Betreff/Grund/Dauer und bietet zwei Aktionen:
 Der Issue wird vom RemoteAccessManager beim Eintreffen einer Anfrage
 erstellt (`_on_connection_request`) und nach Bestätigung/Ablehnung
 gelöscht (`_dismiss_notification`).
+
+Seit #204 zusätzlich der Flow zum Issue ``dashboard_outdated``: Das
+Fernwartungs-Dashboard wurde angepasst und deshalb nach einem Plugin-Update
+nicht automatisch aktualisiert. Der Endkunde wählt „Zurücksetzen" (Standard,
+eigene Anpassungen weg) oder „Behalten".
 """
 
 from __future__ import annotations
@@ -21,6 +26,11 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
 from .const import DATA_REMOTE_ACCESS, DOMAIN, MAX_SESSION_HOURS
+from .dashboard import (
+    DASHBOARD_OUTDATED_ISSUE_ID,
+    async_keep_dashboard,
+    async_reset_dashboard,
+)
 from .remote_access import RemoteAccessManager
 
 
@@ -98,6 +108,30 @@ class ConnectionRequestRepairFlow(RepairsFlow):
         return self.async_create_entry(title="", data={})
 
 
+class DashboardOutdatedRepairFlow(RepairsFlow):
+    """Wizard „Fernwartungs-Dashboard zurücksetzen oder behalten" (#204)."""
+
+    def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
+        self._hass = hass
+        self._entry_id = entry_id
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Einstieg: Menü mit Zurücksetzen / Behalten."""
+        return self.async_show_menu(step_id="init", menu_options=["reset", "keep"])
+
+    async def async_step_reset(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Standard-Config schreiben — eigene Anpassungen gehen verloren."""
+        if not await async_reset_dashboard(self._hass, self._entry_id):
+            return self.async_abort(reason="dashboard_missing")
+        return self.async_create_entry(title="", data={})
+
+    async def async_step_keep(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Angepasstes Dashboard stehen lassen, Issue bis zum nächsten Bump stilllegen."""
+        if not await async_keep_dashboard(self._hass):
+            return self.async_abort(reason="dashboard_missing")
+        return self.async_create_entry(title="", data={})
+
+
 async def async_create_fix_flow(
     hass: HomeAssistant,
     issue_id: str,
@@ -106,6 +140,9 @@ async def async_create_fix_flow(
     """Wird von HA aufgerufen, wenn der Nutzer auf "Beheben" klickt."""
     payload = data or {}
     entry_id: str = payload.get("entry_id", "")
+    if issue_id == DASHBOARD_OUTDATED_ISSUE_ID:
+        return DashboardOutdatedRepairFlow(hass, entry_id)
+
     request_id: str = payload.get("request_id", "")
 
     manager: RemoteAccessManager = hass.data[DOMAIN][entry_id][DATA_REMOTE_ACCESS]

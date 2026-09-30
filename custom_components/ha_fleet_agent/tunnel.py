@@ -65,9 +65,15 @@ _LOGGER = logging.getLogger(__name__)
 #                        alten Slugs, aber WEDER Session beenden NOCH Reconnect
 #                        (der connection_accepted-Handler baut den neuen Tunnel
 #                        selbst auf — ein Reconnect würde mit ihm kollidieren).
+#   REBUILD:             dieselbe Anfrage wird neu aufgebaut, weil das Backend den
+#                        laufenden Tunnel nicht als live kennt (erneutes
+#                        connection_accepted). KEIN DELETE — der würde genau diese
+#                        Anfrage im Backend auf CLOSED setzen —, kein Session-Ende,
+#                        kein Reconnect.
 CLOSE_INTENT_RECONNECT = "reconnect"
 CLOSE_INTENT_END = "end"
 CLOSE_INTENT_HANDOVER = "handover"
+CLOSE_INTENT_REBUILD = "rebuild"
 
 # Headers, die wir an HA NICHT weiterreichen.
 _DROP_REQUEST_HEADERS = frozenset(
@@ -153,9 +159,9 @@ class TunnelForwarder:
         self._active_tunnel_slug: str | None = None
         # Tunnel-Token des aktuellen Tunnels (für X-Tunnel-Token-Header beim Credentials-POST)
         self._active_tunnel_token: str | None = None
-        # requestId des aktuell laufenden Tunnels (Phase A — Idempotenz). Schuetzt gegen
-        # einen erneuten Tunnel-Aufbau, wenn das Backend fuer DIESELBE Anfrage nochmal
-        # connection_accepted liefert (z.B. nach Backend-Neustart mit leerem Tunnel-Cache).
+        # requestId des aktuell laufenden Tunnels (Phase A). Unterscheidet eine neue
+        # Anfrage (Handover) vom erneuten connection_accepted für DIESELBE Anfrage
+        # (Neuaufbau, weil das Backend den Tunnel nicht als live kennt).
         self._active_request_id: str | None = None
 
         # In-flight HTTP-Forward-Tasks — werden bei stop() abgebrochen.
@@ -200,6 +206,17 @@ class TunnelForwarder:
         weder die (bereits neue) Wartungs-Session beendet noch ein Reconnect
         ausgelöst — der Handler baut den neuen Tunnel direkt selbst auf."""
         self._close_intent = CLOSE_INTENT_HANDOVER
+
+    def mark_rebuild_close(self) -> None:
+        """Markiert den nächsten Tunnel-Close als Neuaufbau derselben Anfrage.
+
+        Genutzt vom connection_accepted-Handler, wenn das Backend für die LAUFENDE
+        Anfrage erneut einen Token liefert: Das Backend kennt dann keinen Live-Tunnel
+        (Zugangsdaten nie angekommen, Backend-Neustart mit leerem Cache). Der alte
+        Tunnel wird ohne Credentials-DELETE geschlossen — der DELETE würde die
+        Anfrage im Backend auf CLOSED setzen — und der Handler baut ihn sofort mit
+        dem frischen Token neu auf."""
+        self._close_intent = CLOSE_INTENT_REBUILD
 
     async def async_setup(self) -> None:
         """Keine eigene Session mehr nötig — http_session wird von außen übergeben."""
@@ -310,6 +327,7 @@ class TunnelForwarder:
         """WS-Verbindung wurde getrennt. Reagiert je nach Close-Intent (#108 Phase C):
         END (Endkunde/Unload/Ablauf) → Credentials löschen + Session beenden;
         HANDOVER (neue Anfrage) → nur Credentials des alten Slugs löschen;
+        REBUILD (dieselbe Anfrage neu) → gar nichts abräumen, nur lokal zurücksetzen;
         RECONNECT (unerwarteter Abriss, Default) → Session NICHT beenden, Reconnect
         anstoßen."""
         intent = self._close_intent
@@ -351,8 +369,8 @@ class TunnelForwarder:
             )
             if self._reconnect is not None:
                 self._reconnect()
-        # HANDOVER: nichts weiter — der connection_accepted-Handler baut den neuen
-        # Tunnel direkt selbst auf.
+        # HANDOVER/REBUILD: nichts weiter — der connection_accepted-Handler baut den
+        # neuen Tunnel direkt selbst auf.
 
     async def _safe_on_close(self) -> None:
         try:

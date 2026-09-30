@@ -49,15 +49,42 @@
           "already_resolved": "This request has already been answered."
         }
       }
+    },
+    "dashboard_outdated": {
+      "title": "Remote maintenance dashboard is out of date",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Update the remote maintenance dashboard",
+            "description": "This version of HA Fleet Manager Agent brings new elements for the **Remote maintenance** dashboard. The dashboard was not updated automatically because it may have been customized.\n\n**Reset** replaces the dashboard with the current standard layout. Your own changes to this dashboard will be lost.\n\n**Keep** leaves the dashboard as it is. You will be asked again when a future update changes the dashboard.",
+            "menu_options": {
+              "reset": "Reset dashboard",
+              "keep": "Keep my dashboard"
+            }
+          }
+        },
+        "abort": {
+          "dashboard_missing": "The remote maintenance dashboard could not be found. Restart Home Assistant and try again."
+        }
+      }
     }
   },
   "entity": {
     "sensor": {
       "connection_state": {
-        "name": "Connection status"
+        "name": "Connection status",
+        "state": {
+          "connected": "Connected",
+          "disconnected": "Disconnected"
+        }
       },
       "remote_access_status": {
-        "name": "Remote access status"
+        "name": "Remote access status",
+        "state": {
+          "idle": "Idle",
+          "pre_authorized": "Pre-authorized",
+          "session_active": "Session active"
+        }
       },
       "preauth_expires_at": {
         "name": "Pre-authorization expires at"
@@ -74,6 +101,9 @@
     "switch": {
       "pre_authorization": {
         "name": "Pre-authorization"
+      },
+      "preauth_unlimited": {
+        "name": "Validity without expiry date"
       }
     },
     "number": {
@@ -93,15 +123,19 @@
   "services": {
     "grant_pre_authorization": {
       "name": "Grant pre-authorization",
-      "description": "Grants a time-limited pre-authorization to the integrator (see REQUIREMENTS §4.3). Within this window the integrator can open a connection without further confirmation.",
+      "description": "Grants a pre-authorization to the integrator (see REQUIREMENTS §4.3), either for a limited time or without an expiry date until revoked. While it is active, the integrator can open a connection without further confirmation; each individual session remains limited.",
       "fields": {
         "expires_in_hours": {
           "name": "Valid for (hours)",
-          "description": "Time window during which the pre-authorization remains active."
+          "description": "Time window during which the pre-authorization remains active. Without a value, the configured validity duration applies; ignored when \"Validity without expiry date\" is set."
         },
         "max_duration_hours": {
           "name": "Maximum session duration (hours)",
           "description": "Maximum duration of a single remote-access session."
+        },
+        "unlimited": {
+          "name": "Validity without expiry date",
+          "description": "The pre-authorization applies until it is revoked. Without a value, the \"Validity without expiry date\" switch decides."
         }
       }
     },

@@ -41,13 +41,18 @@ from ha_fleet_agent.const import (
 )
 from ha_fleet_agent.dashboard import (
     DASHBOARD_ICON,
+    DASHBOARD_OUTDATED_ISSUE_ID,
+    DASHBOARD_TEMPLATE_VERSION,
     DASHBOARD_URL_PATH,
     ENTITY_SLOTS,
     LEGACY_FLAG_LANGUAGE,
     _DASHBOARD_TEXTS,
     async_ensure_dashboard,
+    async_keep_dashboard,
     async_remove_dashboard,
+    async_reset_dashboard,
     build_dashboard_config,
+    config_hash,
 )
 
 
@@ -254,10 +259,58 @@ def test_builder_alle_entities_vorhanden_erzeugt_alle_sektionen(
 
     status_tiles = [c for c in sections[1]["cards"] if c["type"] == "tile"]
     assert len(status_tiles) == 5
+    # Vorab-Freigabe, Ohne Ablaufdatum (#167), Gültigkeitsdauer, Max. Sitzungsdauer
     control_tiles = [c for c in sections[2]["cards"] if c["type"] == "tile"]
-    assert len(control_tiles) == 3
+    assert len(control_tiles) == 4
     action_tiles = [c for c in sections[3]["cards"] if c["type"] == "tile"]
     assert len(action_tiles) == 1
+
+
+@pytest.mark.parametrize("lang", ["de", "en", "es", "fr", "hr"])
+def test_builder_bedingte_karte_dauerhaft_freigegeben(lang):
+    """#167: Die Status-Sektion zeigt „Dauerhaft freigegeben", wenn die Vorab-Freigabe
+    an ist und der Ablauf-Sensor keinen Wert hat — nicht über den Konfig-Switch, der
+    erst beim nächsten Erteilen greift."""
+    entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
+
+    cfg = build_dashboard_config(entity_ids, lang)
+
+    status_cards = cfg["views"][0]["sections"][1]["cards"]
+    conditional = [c for c in status_cards if c["type"] == "conditional"]
+    assert len(conditional) == 1
+    card = conditional[0]
+    assert card["conditions"] == [
+        {"condition": "state", "entity": "switch.fa_pre_authorization", "state": "on"},
+        {"condition": "state", "entity": "sensor.fa_preauth_expires_at", "state": "unknown"},
+    ]
+    assert card["card"] == {
+        "type": "markdown",
+        "content": _DASHBOARD_TEXTS[lang]["unlimited_card"],
+    }
+
+
+def test_builder_ohne_ablauf_sensor_keine_bedingte_karte():
+    entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
+    entity_ids["preauth_expires_at"] = None
+
+    cfg = build_dashboard_config(entity_ids, "de")
+
+    status_cards = cfg["views"][0]["sections"][1]["cards"]
+    assert not [c for c in status_cards if c["type"] == "conditional"]
+
+
+def test_builder_switch_ohne_ablaufdatum_steht_in_der_steuerung():
+    entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
+
+    cfg = build_dashboard_config(entity_ids, "de")
+
+    control = cfg["views"][0]["sections"][2]["cards"]
+    entities = [c["entity"] for c in control if c["type"] == "tile"]
+    assert entities[:2] == ["switch.fa_pre_authorization", "switch.fa_preauth_unlimited"]
+    # #204: Der Switch heißt „Gültigkeit ohne Ablaufdatum" — Kachel und Erklärtext.
+    assert "Gültigkeit ohne Ablaufdatum" in cfg["views"][0]["sections"][2]["cards"][1]["content"]
+    tile = next(c for c in control if c.get("entity") == "switch.fa_preauth_unlimited")
+    assert tile["name"] == "Gültigkeit ohne Ablaufdatum"
 
 
 @pytest.mark.parametrize("lang", ["de", "en", "es", "fr", "hr"])
@@ -550,14 +603,15 @@ async def test_ensure_legt_deutsches_dashboard_an_und_setzt_flag(_clean_state):
     assert panel["require_admin"] is False
     assert panel["config"] == {"mode": "storage"}
 
-    # Flag gesetzt inkl. language
+    # Flag gesetzt inkl. language und Hash der geschriebenen Config (#204)
     flag = await _clean_state.async_load()
     assert flag == {
         "created": True,
         "url_path": DASHBOARD_URL_PATH,
         "dashboard_id": "uuid0001",
-        "template_version": 1,
+        "template_version": DASHBOARD_TEMPLATE_VERSION,
         "language": "de",
+        "config_hash": config_hash(storage_obj.saved),
     }
 
 
@@ -664,7 +718,8 @@ async def test_ensure_haengt_storage_nach_neustart_in_gespeicherter_sprache_ein(
             "created": True,
             "url_path": DASHBOARD_URL_PATH,
             "dashboard_id": "uuid-from-prev",
-            "template_version": 1,
+            # Aktuelle Version: reines Wiedereinhängen, keine Aktualisierung (#204).
+            "template_version": DASHBOARD_TEMPLATE_VERSION,
             "language": "en",
         }
     )
@@ -782,8 +837,9 @@ async def test_ensure_respektiert_fremd_dashboard_und_speichert_sprache_ohne_id(
         "created": True,
         "url_path": DASHBOARD_URL_PATH,
         "dashboard_id": None,
-        "template_version": 1,
+        "template_version": DASHBOARD_TEMPLATE_VERSION,
         "language": "en",
+        "config_hash": None,
     }
 
 
@@ -824,6 +880,326 @@ async def test_ensure_flag_ohne_id_bleibt_no_op(_clean_state):
 
     assert lovelace.dashboards == {}
     assert _frontend_calls() == []
+
+
+# --------------------------------------------------------- Aktualisierung (#204)
+
+# Fingerabdruck von Texten und Standard-Config je Template-Version. Wer das
+# Template ändert, bumpt DASHBOARD_TEMPLATE_VERSION und trägt hier den neuen
+# Hash ein — sonst bekämen Bestandsinstallationen die Änderung nie zu sehen.
+_TEMPLATE_HASHES = {
+    2: "c20feb2083e1e47c207bf63f6d8f7abf8a6c78e54c6faac10fee77bb16582e3d",
+}
+
+_OLD_CONFIG = {"title": "Fernwartung", "views": [{"title": "alt", "cards": []}]}
+
+
+def _template_fingerprint() -> str:
+    entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
+    return config_hash(
+        {
+            "texts": _DASHBOARD_TEXTS,
+            "configs": {
+                lang: build_dashboard_config(entity_ids, lang)
+                for lang in sorted(SUPPORTED_LANGUAGES)
+            },
+        }
+    )
+
+
+def test_template_hash_passt_zur_template_version():
+    """Schutztest: Template geändert, ohne DASHBOARD_TEMPLATE_VERSION zu bumpen?"""
+    assert DASHBOARD_TEMPLATE_VERSION in _TEMPLATE_HASHES, (
+        "Neue Template-Version ohne Eintrag in _TEMPLATE_HASHES"
+    )
+    assert _template_fingerprint() == _TEMPLATE_HASHES[DASHBOARD_TEMPLATE_VERSION], (
+        "Dashboard-Template geändert: DASHBOARD_TEMPLATE_VERSION bumpen und den "
+        "neuen Hash in _TEMPLATE_HASHES eintragen"
+    )
+
+
+def test_config_hash_unabhaengig_von_schluessel_reihenfolge():
+    assert config_hash({"a": 1, "b": [1, 2]}) == config_hash({"b": [1, 2], "a": 1})
+    assert config_hash({"a": 1}) != config_hash({"a": 2})
+
+
+def _issue_calls() -> list[dict]:
+    from homeassistant.helpers import issue_registry as ir
+
+    return ir._test_calls  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def issues():
+    _issue_calls().clear()
+    yield _issue_calls()
+    _issue_calls().clear()
+
+
+def _hanging_dashboard(saved: dict | None, dashboard_id: str = "uuid-own"):
+    """Bereits eingehängtes eigenes Dashboard mit gespeicherter Karten-Config."""
+    from homeassistant.components.lovelace.dashboard import LovelaceStorage
+
+    lovelace = _FakeLovelaceData()
+    storage_obj = LovelaceStorage(
+        None, {"id": dashboard_id, "url_path": DASHBOARD_URL_PATH}
+    )
+    storage_obj.saved = saved
+    lovelace.dashboards[DASHBOARD_URL_PATH] = storage_obj
+    return lovelace, storage_obj
+
+
+async def _save_flag(store, **overrides) -> None:
+    flag = {
+        "created": True,
+        "url_path": DASHBOARD_URL_PATH,
+        "dashboard_id": "uuid-own",
+        "template_version": 1,
+        "language": "de",
+    }
+    flag.update(overrides)
+    await store.async_save(flag)
+
+
+def _expected_config(lang: str = "de") -> dict:
+    entity_ids = {slot: f"{platform}.fa_{slot}" for slot, platform, _ in ENTITY_SLOTS}
+    return build_dashboard_config(entity_ids, lang)
+
+
+@pytest.mark.asyncio
+async def test_update_gleiche_version_schreibt_nichts(_clean_state, issues):
+    _install_entities("entry-1")
+    await _save_flag(
+        _clean_state,
+        template_version=DASHBOARD_TEMPLATE_VERSION,
+        config_hash=config_hash(_OLD_CONFIG),
+    )
+    lovelace, storage_obj = _hanging_dashboard({"eigene": "Anpassung"})
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    assert storage_obj.saved == {"eigene": "Anpassung"}
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_update_alte_version_unveraendert_wird_neu_geschrieben(_clean_state, issues):
+    _install_entities("entry-1")
+    await _save_flag(_clean_state, language="en", config_hash=config_hash(_OLD_CONFIG))
+    lovelace, storage_obj = _hanging_dashboard(dict(_OLD_CONFIG))
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    assert storage_obj.saved == _expected_config("en")
+    flag = await _clean_state.async_load()
+    assert flag["template_version"] == DASHBOARD_TEMPLATE_VERSION
+    assert flag["config_hash"] == config_hash(_expected_config("en"))
+    assert flag["dashboard_id"] == "uuid-own"
+    assert flag["language"] == "en"
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_update_alte_version_angepasst_legt_issue_an(_clean_state, issues):
+    _install_entities("entry-1")
+    await _save_flag(_clean_state, config_hash=config_hash(_OLD_CONFIG))
+    angepasst = {**_OLD_CONFIG, "title": "Mein Dashboard"}
+    lovelace, storage_obj = _hanging_dashboard(angepasst)
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    assert storage_obj.saved == angepasst
+    # Version bleibt alt, damit das nicht-persistente Issue nach Neustart wiederkommt.
+    assert (await _clean_state.async_load())["template_version"] == 1
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue["action"] == "create"
+    assert issue["issue_id"] == DASHBOARD_OUTDATED_ISSUE_ID
+    assert issue["translation_key"] == DASHBOARD_OUTDATED_ISSUE_ID
+    assert issue["is_fixable"] is True
+    assert issue["is_persistent"] is False
+    assert issue["data"] == {"entry_id": "entry-1"}
+
+
+@pytest.mark.asyncio
+async def test_update_bestand_ohne_hash_legt_issue_an(_clean_state, issues):
+    """Offene Frage 1 (Denny, 2026-09-29): Ohne Hash gilt das Dashboard als
+    möglicherweise angepasst — nichts überschreiben, Issue anlegen."""
+    _install_entities("entry-1")
+    await _save_flag(_clean_state)  # Bestand vor #204: kein config_hash
+    lovelace, storage_obj = _hanging_dashboard(dict(_OLD_CONFIG))
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    assert storage_obj.saved == _OLD_CONFIG
+    assert [c["issue_id"] for c in issues] == [DASHBOARD_OUTDATED_ISSUE_ID]
+
+
+@pytest.mark.asyncio
+async def test_update_nach_neustart_leerer_store_wird_geschrieben(_clean_state, issues):
+    """Wiedereinhängen nach Neustart, Karten-Store leer → wie unverändert."""
+    _install_entities("entry-1")
+    await _save_flag(_clean_state)
+    lovelace = _FakeLovelaceData()
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    storage_obj = lovelace.dashboards[DASHBOARD_URL_PATH]
+    assert storage_obj.config["id"] == "uuid-own"
+    assert storage_obj.saved == _expected_config("de")
+    assert (await _clean_state.async_load())["template_version"] == DASHBOARD_TEMPLATE_VERSION
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_update_fremd_dashboard_wird_nie_angefasst(_clean_state, issues):
+    _install_entities("entry-1")
+    await _save_flag(_clean_state, dashboard_id=None)
+    lovelace, fremd = _hanging_dashboard({"existing": True}, dashboard_id="fremd-id")
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    assert fremd.saved == {"existing": True}
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_update_fremde_storage_unter_unserem_pfad_bleibt_unangetastet(
+    _clean_state, issues
+):
+    """Flag nennt unsere id, unter dem url_path hängt aber etwas anderes."""
+    _install_entities("entry-1")
+    await _save_flag(_clean_state, config_hash=config_hash(_OLD_CONFIG))
+    lovelace, fremd = _hanging_dashboard(dict(_OLD_CONFIG), dashboard_id="fremd-id")
+
+    await async_ensure_dashboard(_FakeHass(lovelace), _FakeEntry("entry-1"))
+
+    assert fremd.saved == _OLD_CONFIG
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_reset_schreibt_standard_und_loescht_issue(_clean_state, issues):
+    _install_entities("entry-1")
+    await _save_flag(_clean_state)
+    lovelace, storage_obj = _hanging_dashboard({"eigene": "Anpassung"})
+
+    assert await async_reset_dashboard(_FakeHass(lovelace), "entry-1") is True
+
+    assert storage_obj.saved == _expected_config("de")
+    flag = await _clean_state.async_load()
+    assert flag["template_version"] == DASHBOARD_TEMPLATE_VERSION
+    assert flag["config_hash"] == config_hash(_expected_config("de"))
+    assert issues == [
+        {"action": "delete", "domain": DOMAIN, "issue_id": DASHBOARD_OUTDATED_ISSUE_ID}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_keep_laesst_dashboard_und_issue_kommt_erst_beim_naechsten_bump(
+    _clean_state, issues, monkeypatch
+):
+    _install_entities("entry-1")
+    await _save_flag(_clean_state)
+    lovelace, storage_obj = _hanging_dashboard({"eigene": "Anpassung"})
+    hass = _FakeHass(lovelace)
+
+    assert await async_keep_dashboard(hass) is True
+
+    assert storage_obj.saved == {"eigene": "Anpassung"}
+    flag = await _clean_state.async_load()
+    assert flag["template_version"] == DASHBOARD_TEMPLATE_VERSION
+    # Kein Hash: sonst gälte die Anpassung beim nächsten Bump als „unverändert".
+    assert flag["config_hash"] is None
+    assert [c["action"] for c in issues] == ["delete"]
+
+    # Neustart mit gleicher Version → kein neues Issue.
+    issues.clear()
+    await async_ensure_dashboard(hass, _FakeEntry("entry-1"))
+    assert issues == []
+
+    # Nächster Template-Bump → Issue statt stiller Aktualisierung.
+    monkeypatch.setattr(dashboard, "DASHBOARD_TEMPLATE_VERSION", DASHBOARD_TEMPLATE_VERSION + 1)
+    await async_ensure_dashboard(hass, _FakeEntry("entry-1"))
+    assert storage_obj.saved == {"eigene": "Anpassung"}
+    assert [c["issue_id"] for c in issues] == [DASHBOARD_OUTDATED_ISSUE_ID]
+
+
+@pytest.mark.asyncio
+async def test_reset_und_keep_ohne_eigenes_dashboard_liefern_false(_clean_state, issues):
+    await _save_flag(_clean_state, dashboard_id=None)
+    hass = _FakeHass(_FakeLovelaceData())
+
+    assert await async_reset_dashboard(hass, "entry-1") is False
+    assert await async_keep_dashboard(hass) is False
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_fix_flow_menue_und_schritte(_clean_state, issues):
+    from ha_fleet_agent.repairs import DashboardOutdatedRepairFlow, async_create_fix_flow
+
+    _install_entities("entry-1")
+    await _save_flag(_clean_state)
+    lovelace, storage_obj = _hanging_dashboard({"eigene": "Anpassung"})
+    hass = _FakeHass(lovelace)
+
+    flow = await async_create_fix_flow(
+        hass, DASHBOARD_OUTDATED_ISSUE_ID, {"entry_id": "entry-1"}
+    )
+    assert isinstance(flow, DashboardOutdatedRepairFlow)
+
+    menu = await flow.async_step_init()
+    assert menu["type"] == "menu"
+    assert menu["menu_options"] == ["reset", "keep"]
+
+    result = await flow.async_step_reset()
+    assert result["type"] == "create_entry"
+    assert storage_obj.saved == _expected_config("de")
+
+
+@pytest.mark.asyncio
+async def test_fix_flow_ohne_dashboard_bricht_ab(_clean_state, issues):
+    from ha_fleet_agent.repairs import DashboardOutdatedRepairFlow
+
+    flow = DashboardOutdatedRepairFlow(_FakeHass(_FakeLovelaceData()), "entry-1")
+
+    assert (await flow.async_step_reset())["reason"] == "dashboard_missing"
+    assert (await flow.async_step_keep())["reason"] == "dashboard_missing"
+
+
+@pytest.mark.asyncio
+async def test_fix_flow_bricht_bei_defektem_flag_store_ab(_clean_state, issues, monkeypatch):
+    from ha_fleet_agent.repairs import DashboardOutdatedRepairFlow
+
+    lovelace, _storage_obj = _hanging_dashboard({"eigene": "Anpassung"})
+
+    async def _kaputt():
+        raise ValueError("Flag-Store korrupt")
+
+    monkeypatch.setattr(_clean_state, "async_load", _kaputt)
+    flow = DashboardOutdatedRepairFlow(_FakeHass(lovelace), "entry-1")
+
+    assert (await flow.async_step_reset())["reason"] == "dashboard_missing"
+    assert (await flow.async_step_keep())["reason"] == "dashboard_missing"
+
+
+@pytest.mark.asyncio
+async def test_fix_flow_reset_bricht_bei_schreibfehler_ab(_clean_state, issues, monkeypatch):
+    from ha_fleet_agent.repairs import DashboardOutdatedRepairFlow
+
+    _install_entities("entry-1")
+    await _save_flag(_clean_state)
+    lovelace, storage_obj = _hanging_dashboard({"eigene": "Anpassung"})
+
+    async def _kaputt(_config):
+        raise OSError("Platte voll")
+
+    monkeypatch.setattr(storage_obj, "async_save", _kaputt)
+    flow = DashboardOutdatedRepairFlow(_FakeHass(lovelace), "entry-1")
+
+    assert (await flow.async_step_reset())["reason"] == "dashboard_missing"
+    assert (await _clean_state.async_load())["template_version"] == 1
 
 
 # --------------------------------------------------------- remove-Tests
