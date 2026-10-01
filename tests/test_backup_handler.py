@@ -1184,3 +1184,404 @@ def test_kit_notice_has_texts_for_all_supported_languages():
         assert texts["title"]
         assert "{date}" in texts["message"]
     assert backup_kit_notice.texts("xx") == backup_kit_notice.texts("en")
+
+
+# ============================================================ Fehler- und Aufräumpfade (#211)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_during_upload_reports_unexpected_error_and_keeps_encrypted_backup(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    async def _kaputt(*_args, **_kwargs):
+        raise ValueError("unerwartet")
+
+    monkeypatch.setattr(handler, "_upload", _kaputt)
+
+    await _deliver(handler, hass)
+
+    assert _statuses(backend) == ["creating", "uploading", "failed"]
+    assert backend.reports[-1]["error"] == "unexpected_error: ValueError: unerwartet"
+    assert handler._find_done(REQUEST_ID) == {"request_id": REQUEST_ID, "status": "failed",
+                                              "error": "unexpected_error"}
+    assert handler._store.data["job"] is None
+    assert manager.deleted == []
+    assert "bk1" in manager.agent.backups
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_before_encryption_check_deletes_unencrypted_backup(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+    klartext = FakeBackup("bk1", 0, False, {"fleet_agent.request_id": REQUEST_ID}, b"")
+    klartext.size = "kaputt"  # int() scheitert, bevor „protected“ geprüft ist
+    manager.agent.backups["bk1"] = klartext
+
+    async def _create(*_args, **_kwargs):
+        return klartext
+
+    monkeypatch.setattr(handler, "_create", _create)
+
+    await _deliver(handler, hass)
+
+    assert _statuses(backend) == ["creating", "failed"]
+    assert backend.reports[-1]["error"].startswith("unexpected_error: ValueError")
+    assert manager.deleted == [("bk1", ["hassio.local"])]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_after_restart_reports_and_keeps_backup(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+    content = _content()
+    manager = FakeManager(content=content)
+    manager.agent.backups["bk7"] = FakeBackup("bk7", len(content), True,
+                                              {"fleet_agent.request_id": REQUEST_ID}, content)
+    store = FakeStore({"job": {"request_id": REQUEST_ID, "phase": "uploading", "backup_id": "bk7",
+                               "size": len(content)}, "done": []})
+    handler = _handler(hass, backend, manager, store=store)
+
+    async def _kaputt(*_args, **_kwargs):
+        raise KeyError("bk7")
+
+    monkeypatch.setattr(handler, "_local_backup", _kaputt)
+
+    await handler.async_setup()
+    await handler._async_resume_after_start(hass)
+    await hass.settle()
+
+    assert backend.reports == [{"request_id": REQUEST_ID, "status": "failed",
+                                "error": "unexpected_error: KeyError: 'bk7'"}]
+    assert handler._find_done(REQUEST_ID)["error"] == "unexpected_error"
+    assert store.data["job"] is None
+    assert "bk7" in manager.agent.backups
+
+
+@pytest.mark.asyncio
+async def test_proxy_404_without_error_is_retried_like_a_server_error():
+    hass, backend = FakeHass(), FakeBackend()
+    content = _content()
+    # Proxy-Fehlerseite während eines Deploys: 404 ohne JSON-``error``.
+    backend.scripted.append(("PUT", "/content", FakeResponse(404)))
+    manager = FakeManager(content=content)
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert bytes(backend.received[REQUEST_ID]) == content
+    assert handler._find_done(REQUEST_ID)["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_backend_404_with_error_stays_final():
+    hass, backend = FakeHass(), FakeBackend()
+    backend.scripted.append(("PUT", "/content", FakeResponse(404, {"error": "Resource not found"})))
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert len(backend.put_ranges) == 1
+    assert backend.reports[-1] == {"request_id": REQUEST_ID, "status": "failed",
+                                   "error": "upload_failed: HTTP 404 Resource not found"}
+
+
+@pytest.mark.asyncio
+async def test_proxy_404_on_report_is_retried():
+    hass, backend = FakeHass(), FakeBackend()
+    backend.scripted.append(("POST", "/report", FakeResponse(404)))
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert _statuses(backend) == ["creating", "uploading"]
+    assert handler._find_done(REQUEST_ID)["status"] == "ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("body", "resumed"), [({}, True), ({"error": "Resource not found"}, False)])
+async def test_server_state_404_is_closed_only_with_backend_error(body, resumed):
+    hass, backend = FakeHass(), FakeBackend()
+    content = _content()
+    manager = FakeManager(content=content)
+    manager.agent.backups["bk7"] = FakeBackup("bk7", len(content), True,
+                                              {"fleet_agent.request_id": REQUEST_ID}, content)
+    backend.status[REQUEST_ID] = "uploading"
+    backend.scripted.append(("GET", "/content", FakeResponse(404, body)))
+    store = FakeStore({"job": {"request_id": REQUEST_ID, "phase": "uploading", "backup_id": "bk7",
+                               "size": len(content), "chunk_bytes": CHUNK}, "done": []})
+    handler = _handler(hass, backend, manager, store=store)
+
+    await handler.async_setup()
+    await handler._async_resume_after_start(hass)
+    await hass.settle()
+
+    assert (handler._find_done(REQUEST_ID)["status"] == "ready") is resumed
+    assert bool(backend.put_ranges) is resumed
+
+
+@pytest.mark.asyncio
+async def test_unreachable_backend_books_failed_and_redelivery_reports_it():
+    hass, backend = FakeHass(), FakeBackend()
+    # Die Meldung „creating“ kommt in keinem der drei Versuche an.
+    backend.scripted.extend([("POST", "/report", FakeResponse(503))] * 3)
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert backend.reports == []
+    assert manager.initiate_calls == []
+    assert handler._find_done(REQUEST_ID)["status"] == "failed"
+
+    await _deliver(handler, hass)  # das Backend stellt den Auftrag erneut zu
+
+    assert backend.reports == [{"request_id": REQUEST_ID, "status": "failed",
+                                "error": "upload_failed: backend_unreachable"}]
+    assert manager.initiate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_closed_session_counts_as_network_error():
+    hass, backend = FakeHass(), FakeBackend()
+
+    def _closed(*_args, **_kwargs):
+        raise RuntimeError("Session is closed")
+
+    backend.post = _closed
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert handler._find_done(REQUEST_ID)["error"] == "upload_failed: backend_unreachable"
+
+
+def _resume_handler(hass: FakeHass, backend: FakeBackend) -> tuple[BackupRequestHandler, FakeManager]:
+    """Handler mit einem Auftrag im Upload, wie nach einem HA-Neustart."""
+    content = _content()
+    manager = FakeManager(content=content)
+    manager.agent.backups["bk7"] = FakeBackup("bk7", len(content), True,
+                                              {"fleet_agent.request_id": REQUEST_ID}, content)
+    backend.status[REQUEST_ID] = "uploading"
+    store = FakeStore({"job": {"request_id": REQUEST_ID, "phase": "uploading", "backup_id": "bk7",
+                               "size": len(content), "chunk_bytes": CHUNK}, "done": []})
+    return _handler(hass, backend, manager, store=store), manager
+
+
+@pytest.mark.asyncio
+async def test_server_state_404_with_backend_error_books_closed_without_report():
+    hass, backend = FakeHass(), FakeBackend()
+    backend.scripted.append(("GET", "/content", FakeResponse(404, {"error": "Resource not found"})))
+    handler, manager = _resume_handler(hass, backend)
+
+    await handler.async_setup()
+    await handler._async_resume_after_start(hass)
+    await hass.settle()
+
+    assert handler._find_done(REQUEST_ID)["status"] == "closed"
+    assert backend.reports == []
+    assert "bk7" in manager.agent.backups
+
+
+@pytest.mark.asyncio
+async def test_persistent_proxy_404_after_restart_books_backend_unreachable():
+    hass, backend = FakeHass(), FakeBackend()
+    # Der Proxy antwortet in allen Versuchen mit 404 ohne ``error`` — das Backend ist nicht da.
+    backend.scripted.extend([("GET", "/content", FakeResponse(404))] * backup_module.BACKUP_RESUME_ATTEMPTS)
+    handler, manager = _resume_handler(hass, backend)
+
+    await handler.async_setup()
+    await handler._async_resume_after_start(hass)
+    await hass.settle()
+
+    done = handler._find_done(REQUEST_ID)
+    assert done["status"] == "failed"
+    assert done["error"] == "upload_failed: backend_unreachable"
+    assert backend.put_ranges == []
+    assert "bk7" in manager.agent.backups
+
+
+@pytest.mark.asyncio
+async def test_unreachable_complete_books_backend_unreachable():
+    hass, backend = FakeHass(), FakeBackend()
+    # Der Abschluss kommt in keinem der drei Versuche an.
+    backend.scripted.extend([("POST", "/complete", FakeResponse(503))] * 3)
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert _statuses(backend) == ["creating", "uploading"]
+    assert backend.completes == []
+    done = handler._find_done(REQUEST_ID)
+    assert done["status"] == "failed"
+    assert done["error"] == "upload_failed: backend_unreachable"
+
+
+class _HangingResponse(FakeResponse):
+    async def __aenter__(self):
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_rereport_and_unsubscribes_start(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+    unsubscribed: list[bool] = []
+    monkeypatch.setattr(backup_module, "async_at_started",
+                        lambda _hass, _func: lambda: unsubscribed.append(True))
+    store = FakeStore({"job": None, "done": [{"request_id": REQUEST_ID, "status": "failed",
+                                              "error": "create_failed"}]})
+    handler = _handler(hass, backend, FakeManager(), store=store)
+    await handler.async_setup()
+    backend.scripted.append(("POST", "/report", _HangingResponse(204)))
+
+    await handler.handle({"action": "backup_create", "requestId": REQUEST_ID})
+    await asyncio.sleep(0)
+    rereport = next(iter(handler._side_tasks))
+
+    await handler.async_shutdown()
+
+    assert rereport.cancelled()
+    assert handler._side_tasks == set()
+    assert unsubscribed == [True]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_resume_routine_that_is_already_running(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+
+    def _at_started(hass_, func):  # noqa: ANN001 — HA läuft schon: sofort aufrufen
+        func(hass_)
+        return lambda: None
+
+    monkeypatch.setattr(backup_module, "async_at_started", _at_started)
+    # Mitten im Erzeugen neu gestartet: Die Routine meldet ``ha_restarted`` und hängt dabei.
+    backend.scripted.append(("POST", "/report", _HangingResponse(204)))
+    store = FakeStore({"job": {"request_id": REQUEST_ID, "phase": "creating"}, "done": []})
+    handler = _handler(hass, backend, FakeManager(content=_content()), store=store)
+
+    await handler.async_setup()
+    await asyncio.sleep(0)
+    resume = next(iter(handler._side_tasks))
+
+    await handler.async_shutdown()
+
+    assert resume.cancelled()
+    assert handler._find_done(REQUEST_ID) is None
+    assert store.data["job"]["request_id"] == REQUEST_ID
+
+
+@pytest.mark.asyncio
+async def test_new_request_during_resume_routine_supersedes_old_job(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+    new_id = "7f1c2d3e-0000-4000-8000-000000000002"
+    handler, _manager = _resume_handler(hass, backend)
+    store = handler._store
+    await handler.async_setup()
+    original_prune = handler._prune_local
+    calls: list[int] = []
+
+    async def _prune_mit_neuem_auftrag(*args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:
+            return await original_prune(*args, **kwargs)
+        # Während des Aufräumens stellt das Backend einen neuen Auftrag zu. Wie im Betrieb
+        # (I/O in ``_prune_local``) speichert der neue Auftrag seinen Zustand, bevor die
+        # Routine weitermacht.
+        await handler.handle({"action": "backup_create", "requestId": new_id,
+                              "maxBytes": 10_000, "chunkBytes": CHUNK})
+        while not (store.data.get("job") or {}).get("request_id") == new_id:
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(handler, "_prune_local", _prune_mit_neuem_auftrag)
+
+    await handler._async_resume_after_start(hass)
+
+    assert handler._task_request_id == new_id
+    assert handler._find_done(REQUEST_ID)["status"] == "closed"
+    assert store.data["job"]["request_id"] == new_id  # der neue Auftrag bleibt gespeichert
+    await hass.settle()
+    assert handler._find_done(new_id)["status"] == "ready"
+    assert REQUEST_ID not in backend.received  # der alte Auftrag lädt nichts mehr hoch
+
+
+@pytest.mark.asyncio
+async def test_same_request_redelivered_during_resume_routine_is_not_closed(monkeypatch):
+    hass, backend = FakeHass(), FakeBackend()
+    handler, _manager = _resume_handler(hass, backend)
+    await handler.async_setup()
+
+    async def _prune_mit_erneuter_zustellung(*_args, **_kwargs):
+        await handler.handle({"action": "backup_create", "requestId": REQUEST_ID,
+                              "maxBytes": 10_000, "chunkBytes": CHUNK})
+
+    monkeypatch.setattr(handler, "_prune_local", _prune_mit_erneuter_zustellung)
+
+    await handler._async_resume_after_start(hass)
+
+    assert handler._task_request_id == REQUEST_ID
+    assert handler._find_done(REQUEST_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_failing_resume_routine_is_logged_not_lost(monkeypatch, caplog):
+    hass, backend = FakeHass(), FakeBackend()
+
+    def _at_started(hass_, func):  # noqa: ANN001 — HA läuft schon: sofort aufrufen
+        func(hass_)
+        return lambda: None
+
+    def _kaputt(*_args, **_kwargs):
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(backup_module, "async_at_started", _at_started)
+    backend.post = _kaputt
+    store = FakeStore({"job": {"request_id": REQUEST_ID, "phase": "creating"}, "done": []})
+    handler = _handler(hass, backend, FakeManager(content=_content()), store=store)
+
+    await handler.async_setup()
+    resume = next(iter(handler._side_tasks))
+    await asyncio.gather(resume, return_exceptions=True)
+
+    assert resume.exception() is None
+    assert "Fortsetzen nach dem HA-Start gescheitert" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_other_runtime_error_is_unexpected_not_network_error():
+    hass, backend = FakeHass(), FakeBackend()
+
+    def _kaputt(*_args, **_kwargs):
+        raise RuntimeError("kaputt")
+
+    backend.put = _kaputt
+    manager = FakeManager(content=_content())
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert backend.reports[-1] == {"request_id": REQUEST_ID, "status": "failed",
+                                   "error": "unexpected_error: RuntimeError: kaputt"}
+    assert handler._find_done(REQUEST_ID)["error"] == "unexpected_error"
+
+
+@pytest.mark.asyncio
+async def test_remove_store_deletes_the_backup_job_store(monkeypatch):
+    removed: list[str] = []
+
+    class _Store:
+        def __init__(self, _hass, _version, key):
+            self.key = key
+
+        async def async_remove(self):
+            removed.append(self.key)
+
+    monkeypatch.setattr(backup_module, "Store", _Store)
+
+    await backup_module.async_remove_store(FakeHass(), "entry1")
+
+    assert removed == ["ha_fleet_agent.backup_jobs.entry1"]

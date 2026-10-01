@@ -6,7 +6,7 @@ Bloecke:
 1. ``build_dashboard_config`` — reiner Dict-Builder (deterministisch, kein HA).
    Sprach-parametrisiert: DE-Substrings nur bei ``lang="de"``, EN-Substrings
    nur bei ``lang="en"``.
-2. ``_resolve_language`` — Mapping ``hass.config.language`` → Plugin-Sprache.
+2. ``language.resolve_language`` — Mapping ``hass.config.language`` → Plugin-Sprache.
 3. ``_resolve_entity_ids`` — Aufloesung ueber die Entity-Registry per
    ``unique_id`` (NICHT per Slug-Raten).
 4. ``async_ensure_dashboard`` / ``async_remove_dashboard`` — Lebenszyklus
@@ -32,7 +32,7 @@ import asyncio
 
 import pytest
 
-from ha_fleet_agent import dashboard
+from ha_fleet_agent import dashboard, language
 from ha_fleet_agent.const import (
     CONF_LANGUAGE,
     DEFAULT_LANGUAGE,
@@ -495,17 +495,17 @@ def test_builder_alle_entities_fehlen_zeigt_nur_kopf_erklaerung():
 def test_resolve_language_mappt_korrekt(raw, expected):
     hass = _FakeHass()
     hass.config.language = raw
-    assert dashboard._resolve_language(hass) == expected
+    assert language.resolve_language(hass) == expected
 
 
 def test_resolve_language_ohne_config_attribut_faellt_auf_default():
     """Setup kann sehr frueh laufen — ``hass.config`` darf fehlen / leer sein."""
     hass = _FakeHass()
     hass.config = object()  # kein `language`-Attribut
-    assert dashboard._resolve_language(hass) == "en"
+    assert language.resolve_language(hass) == "en"
 
 
-# --------------------------------------------------------- _lang_from_entry
+# --------------------------------------------------------- language.lang_from_entry
 
 
 @pytest.mark.parametrize(
@@ -537,7 +537,7 @@ def test_lang_from_entry_priorisiert_entry_data_dann_hass(
     hass = _FakeHass(language=hass_lang)
     data = {} if entry_lang is None else {CONF_LANGUAGE: entry_lang}
     entry = _FakeEntry("entry-1", data=data)
-    assert dashboard._lang_from_entry(entry, hass) == expected
+    assert language.lang_from_entry(entry, hass) == expected
 
 
 # --------------------------------------------------------- Resolve-Tests

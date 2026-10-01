@@ -60,7 +60,7 @@ from datetime import datetime
 from typing import Any
 
 import aiohttp
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 
@@ -117,6 +117,10 @@ ERROR_UPLOAD_FAILED = "upload_failed"
 ERROR_SETTINGS_UNSUPPORTED = "settings_unsupported"
 ERROR_ADDON_NOT_INSTALLED = "addon_not_installed"
 ERROR_EMERGENCY_KIT_CHANGED = "emergency_kit_changed"
+# Letzter Fang für alles, was keiner der Pfade oben erwartet (#211, C7).
+ERROR_UNEXPECTED = "unexpected_error"
+# Zusatz zu ``upload_failed``, wenn eine Meldung das Backend nicht erreicht hat (#211).
+DETAIL_BACKEND_UNREACHABLE = "backend_unreachable"
 
 # Modus der Backup-Einstellungen (#203). Ohne ``settings`` im Poll gilt „automatic“.
 MODE_AUTOMATIC = "automatic"
@@ -148,8 +152,16 @@ class BackupJobAborted(Exception):
     """Der Auftrag endet ohne eigenen Fehlerreport.
 
     Das Backend hat ihn geschlossen (``410``) oder selbst als fehlgeschlagen gebucht
-    (Kontingent, Prüfung beim Abschluss) — oder ist gar nicht erreichbar.
+    (Kontingent, Prüfung beim Abschluss).
     """
+
+
+class _BackendUnreachable(BackupJobAborted):
+    """Eine Meldung hat das Backend auch nach allen Versuchen nicht erreicht.
+
+    Kein Fehlerreport — der käme ebenso wenig an —, aber lokal als ``failed`` gebucht: Stellt
+    das Backend den Auftrag erneut zu, beantwortet ``_rereport`` ihn dann mit ``failed``,
+    statt zu schweigen (#211)."""
 
 
 class _OffsetMismatch(Exception):
@@ -158,6 +170,16 @@ class _OffsetMismatch(Exception):
     def __init__(self, received: int) -> None:
         super().__init__(received)
         self.received = received
+
+
+def _job_store(hass: HomeAssistant, entry_id: str) -> Store:
+    return Store(hass, STORAGE_VERSION, f"{BACKUP_STORAGE_KEY_PREFIX}.{entry_id}")
+
+
+async def async_remove_store(hass: HomeAssistant, entry_id: str) -> None:
+    """Löscht den Auftragszustand, wenn die Integration entfernt wird (#211, C9). Fertige
+    Backups bleiben in HA wie jedes andere Backup des Kunden (#201)."""
+    await _job_store(hass, entry_id).async_remove()
 
 
 def _default_manager_getter(hass: HomeAssistant) -> Any:
@@ -241,9 +263,7 @@ class BackupRequestHandler:
         self._api_key = api_key
         self._manager_getter = manager_getter or _default_manager_getter
         self._ha_version = ha_version if ha_version is not None else _running_ha_version()
-        self._store = store or Store(
-            hass, STORAGE_VERSION, f"{BACKUP_STORAGE_KEY_PREFIX}.{entry_id}"
-        )
+        self._store = store or _job_store(hass, entry_id)
         # Gespeicherter Auftrag: {request_id, phase, backup_id?, size?, chunk_bytes, max_bytes,
         # settings, key_sha256?}. Den Schlüssel selbst speichert er nie.
         self._job: dict[str, Any] | None = None
@@ -256,6 +276,9 @@ class BackupRequestHandler:
         # Auftrag statt als ein Flag, weil der neue Task schon läuft, wenn der alte seinen
         # Abbruch verarbeitet.
         self._superseded: set[str] = set()
+        # Nebenläufige Meldungen (``_rereport``) — beim Entladen abbrechen (#211).
+        self._side_tasks: set[asyncio.Task] = set()
+        self._unsub_started: Callable[[], None] | None = None
 
     # ------------------------------------------------------------------ Lebenszyklus
 
@@ -268,19 +291,41 @@ class BackupRequestHandler:
         self._done = [d for d in done if isinstance(d, dict)][-BACKUP_DONE_HISTORY:] if isinstance(done, list) else []
         # Der Backup-Manager ist bis zum Ende des Starts blockiert — erst danach aufräumen
         # oder fortsetzen. Läuft HA schon, ruft HA die Routine sofort auf.
-        async_at_started(self._hass, self._async_resume_after_start)
+        self._unsub_started = async_at_started(self._hass, self._schedule_resume)
+
+    @callback
+    def _schedule_resume(self, _hass: HomeAssistant | None = None) -> None:
+        """Startet die Routine nach dem HA-Start als verfolgten Task, damit ``async_shutdown``
+        sie auch dann abbricht, wenn sie beim Entladen schon läuft (#211)."""
+        self._start(self._logged(self._async_resume_after_start(), "Fortsetzen nach dem HA-Start"),
+                    request_id=None)
+
+    @staticmethod
+    async def _logged(coro: Any, what: str) -> None:
+        """Letzter Fang für Nebentasks: Ein Fehler landet mit Traceback im Log statt als
+        „Task exception was never retrieved“ (#211)."""
+        try:
+            await coro
+        except Exception:  # noqa: BLE001 — ein Nebentask darf nicht still scheitern
+            _LOGGER.exception("Backup: %s gescheitert", what)
 
     async def async_shutdown(self) -> None:
         """Beim Entladen: laufenden Auftrag stoppen, Zustand bleibt für die Fortsetzung."""
-        task = self._task
-        if task is not None and not task.done():
+        if self._unsub_started is not None:
+            # Entladen vor dem Ende des HA-Starts: Die Routine darf nicht mehr laufen.
+            self._unsub_started()
+            self._unsub_started = None
+        tasks = [t for t in (self._task, *self._side_tasks) if t is not None and not t.done()]
+        for task in tasks:
             task.cancel()
+        for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
             except Exception:  # noqa: BLE001 — Entladen darf nicht scheitern
-                _LOGGER.debug("Backup-Auftrag beim Entladen mit Fehler beendet", exc_info=True)
+                _LOGGER.debug("Backup-Task beim Entladen mit Fehler beendet", exc_info=True)
+        self._side_tasks.clear()
 
     # ------------------------------------------------------------------ Poll-Aktion
 
@@ -301,7 +346,7 @@ class BackupRequestHandler:
         if done is not None:
             _LOGGER.info("backup_create %s ist schon erledigt (%s) — Endzustand erneut melden",
                          request_id, done.get("status"))
-            self._start(self._rereport(done), request_id=None)
+            self._start(self._logged(self._rereport(done), "erneute Meldung"), request_id=None)
             return
 
         if self._task is not None and not self._task.done():
@@ -327,6 +372,9 @@ class BackupRequestHandler:
         if request_id is not None:
             self._task = task
             self._task_request_id = request_id
+        else:
+            self._side_tasks.add(task)
+            task.add_done_callback(self._side_tasks.discard)
 
     def _is_running(self, request_id: str) -> bool:
         return (
@@ -349,6 +397,7 @@ class BackupRequestHandler:
         manager: Any = None
         local_id: str | None = None
         backup_id: str | None = None
+        verified_id: str | None = None  # als verschlüsselt geprüft
         try:
             await self._save_job({
                 "request_id": request_id,
@@ -371,6 +420,7 @@ class BackupRequestHandler:
             # hier herunterfährt und der Neustart-Pfad das Backup als laufendes behält.
             if not getattr(backup, "protected", False):
                 raise BackupJobFailed(ERROR_BACKUP_NOT_ENCRYPTED)
+            verified_id = backup_id
             job: dict[str, Any] = {
                 "request_id": request_id,
                 "phase": PHASE_UPLOADING,
@@ -401,6 +451,8 @@ class BackupRequestHandler:
             if err.code == ERROR_BACKUP_NOT_ENCRYPTED:
                 # Klartext bleibt nicht liegen (E3) — das einzige Backup, das sofort geht.
                 await self._delete_local(manager, local_id, backup_id)
+        except _BackendUnreachable as err:
+            await self._finish_unreachable(request_id, err)
         except BackupJobAborted as err:
             _LOGGER.info("Backup-Auftrag %s beendet: %s", request_id, err)
             await self._finish(request_id, DONE_CLOSED)
@@ -411,6 +463,8 @@ class BackupRequestHandler:
                 await self._finish(request_id, DONE_CLOSED)
             # Sonst fährt HA herunter: Zustand bleibt, der Upload setzt danach fort.
             raise
+        except Exception as err:  # noqa: BLE001 — letzter Fang (#211, C7)
+            await self._fail_unexpected(request_id, err, manager, local_id, keep_backup_id=verified_id)
 
     def _precheck(self) -> tuple[Any, str]:
         """Voraussetzungen prüfen, bevor irgendetwas angelegt wird."""
@@ -586,7 +640,8 @@ class BackupRequestHandler:
         # aclosing: Bricht der Upload ab, schließt die Quelle sofort (Datei, Supervisor-Stream).
         async with aclosing(self._chunks(manager, local_id, backup_id, chunk_bytes)) as chunks:
             async for chunk in chunks:
-                hasher.update(chunk)
+                # Mehrere MB je Stück — nicht im Eventloop hashen.
+                await self._hass.async_add_executor_job(hasher.update, chunk)
                 start = position
                 end = position + len(chunk)
                 position = end
@@ -682,11 +737,13 @@ class BackupRequestHandler:
                         if slot_waits > BACKUP_MAX_SLOT_WAITS:
                             raise BackupJobFailed(ERROR_UPLOAD_FAILED, "upload_slots_exhausted")
                         retry_after = _retry_after(resp)
-                    elif resp.status >= 500 or resp.status in (408, 429, 499) or error == "upload_busy":
+                    elif _transient(resp.status, error) or resp.status in (408, 429, 499) or error == "upload_busy":
                         last_error = f"HTTP {resp.status} {error}".strip()
                     else:
                         raise BackupJobFailed(ERROR_UPLOAD_FAILED, f"HTTP {resp.status} {error}".strip())
-            except (aiohttp.ClientError, TimeoutError) as err:
+            except _NETWORK_ERRORS as err:
+                if not _is_network_error(err):
+                    raise
                 last_error = _short(err) or type(err).__name__
             if retry_after is not None:
                 await asyncio.sleep(retry_after)
@@ -702,7 +759,7 @@ class BackupRequestHandler:
         body = {"sha256": sha256, "sizeBytes": size}
         status, error = await self._post(url, body, BACKUP_COMPLETE_TIMEOUT_SECONDS)
         if status is None:
-            raise BackupJobAborted(f"Abschluss nicht erreichbar: {error}")
+            raise _BackendUnreachable(f"Abschluss nicht angekommen: {error}")
         if status == 410:
             raise BackupJobAborted("request_closed")
         if status >= 300:
@@ -710,17 +767,23 @@ class BackupRequestHandler:
             raise BackupJobAborted(f"Abschluss abgelehnt: HTTP {status} {error}".strip())
 
     async def _server_state(self, request_id: str) -> dict[str, Any] | None:
-        """``GET …/content``: Stand beim Server, ``{"status": "closed"}`` bei 410, sonst None."""
+        """``GET …/content``: Stand beim Server, ``{"status": "closed"}`` bei 410 und bei 404
+        des Backends, sonst None — auch bei einem 404 des Proxys während eines Deploys."""
         url = f"{self._backend_url}/api/agent/backup-requests/{request_id}/content"
         timeout = aiohttp.ClientTimeout(total=BACKUP_REPORT_TIMEOUT_SECONDS)
         try:
             async with self._session.get(url, headers={"X-API-Key": self._api_key}, timeout=timeout) as resp:
-                if resp.status == 410 or resp.status == 404:
+                if resp.status == 410:
                     return {"status": "closed"}
+                if resp.status == 404:
+                    body = await _json_body(resp)
+                    return None if _transient(404, str(body.get("error") or "")) else {"status": "closed"}
                 if 200 <= resp.status < 300:
                     return await _json_body(resp)
                 return None
-        except (aiohttp.ClientError, TimeoutError):
+        except _NETWORK_ERRORS as err:
+            if not _is_network_error(err):
+                raise
             return None
 
     # ------------------------------------------------------------------ Meldungen
@@ -743,7 +806,7 @@ class BackupRequestHandler:
         url = f"{self._backend_url}/api/agent/backup-requests/{request_id}/report"
         code, detail = await self._post(url, body, BACKUP_REPORT_TIMEOUT_SECONDS)
         if code is None:
-            raise BackupJobAborted(f"Backend nicht erreichbar: {detail}")
+            raise _BackendUnreachable(f"Meldung „{status}“ nicht angekommen: {detail}")
         if code >= 300:
             # 410 geschlossen, 409/413 Platz oder Größe abgelehnt — das Backend hat den
             # Auftrag dann schon selbst beendet.
@@ -780,7 +843,8 @@ class BackupRequestHandler:
             _LOGGER.debug("Fehlerreport für %s nicht angenommen: %s", request_id, aborted)
 
     async def _post(self, url: str, body: dict[str, Any], timeout_s: float) -> tuple[int | None, str]:
-        """POST mit drei Versuchen bei Netzfehlern und 5xx. Liefert (Status, Fehlercode)."""
+        """POST mit drei Versuchen bei Netzfehlern, 5xx und 404 des Proxys. Liefert
+        (Status, Fehlercode); ``None`` als Status heißt: nicht angekommen."""
         headers = {"X-API-Key": self._api_key, "Content-Type": "application/json"}
         timeout = aiohttp.ClientTimeout(total=timeout_s)
         attempts = len(BACKUP_REPORT_BACKOFF_SECONDS) + 1
@@ -788,11 +852,14 @@ class BackupRequestHandler:
         for attempt in range(attempts):
             try:
                 async with self._session.post(url, json=body, headers=headers, timeout=timeout) as resp:
-                    if resp.status < 500:
-                        payload = await _json_body(resp) if resp.status >= 300 else {}
-                        return resp.status, str(payload.get("error") or "")
+                    payload = await _json_body(resp) if resp.status >= 300 else {}
+                    error = str(payload.get("error") or "")
+                    if not _transient(resp.status, error):
+                        return resp.status, error
                     last = (None, f"HTTP {resp.status}")
-            except (aiohttp.ClientError, TimeoutError) as err:
+            except _NETWORK_ERRORS as err:
+                if not _is_network_error(err):
+                    raise
                 last = (None, _short(err) or type(err).__name__)
             if attempt < len(BACKUP_REPORT_BACKOFF_SECONDS):
                 await asyncio.sleep(BACKUP_REPORT_BACKOFF_SECONDS[attempt])
@@ -843,6 +910,17 @@ class BackupRequestHandler:
             await self._finish(request_id, DONE_FAILED, error=ERROR_LOCAL_AGENT_MISSING)
             return
         await self._prune_local(manager, local_id, keep_backup_id=str(job["backup_id"]))
+        if self._task is not None and not self._task.done():
+            if self._task_request_id == request_id:
+                # Derselbe Auftrag wurde erneut zugestellt und läuft schon — der Lauf ist maßgeblich.
+                return
+            # Während des Aufräumens kam ein neuer Auftrag. Das Backend hält nur einen
+            # offenen, der alte ist dort beendet — nicht fortsetzen, sonst verdrängt er den
+            # neuen aus ``_task`` (#211).
+            _LOGGER.info("Backup-Auftrag %s von %s abgelöst — nicht fortgesetzt",
+                         request_id, self._task_request_id)
+            await self._finish(request_id, DONE_CLOSED)
+            return
         self._start(self._resume_upload(manager, local_id, job), request_id=request_id)
 
     async def _resume_upload(self, manager: Any, local_id: str, job: dict[str, Any]) -> None:
@@ -861,7 +939,7 @@ class BackupRequestHandler:
                 if attempt + 1 < BACKUP_RESUME_ATTEMPTS:
                     await asyncio.sleep(BACKUP_RESUME_RETRY_SECONDS)
             if state is None:
-                raise BackupJobAborted("Backend nach dem Neustart nicht erreichbar")
+                raise _BackendUnreachable("Backend nach dem Neustart nicht erreichbar")
             status = str(state.get("status") or "")
             if status == "closed":
                 raise BackupJobAborted("request_closed")
@@ -887,6 +965,8 @@ class BackupRequestHandler:
             _LOGGER.warning("Backup-Auftrag %s fehlgeschlagen: %s", request_id, err)
             await self._report_failed(request_id, err)
             await self._finish(request_id, DONE_FAILED, error=err.code)
+        except _BackendUnreachable as err:
+            await self._finish_unreachable(request_id, err)
         except BackupJobAborted as err:
             _LOGGER.info("Backup-Auftrag %s beendet: %s", request_id, err)
             await self._finish(request_id, DONE_CLOSED)
@@ -895,6 +975,33 @@ class BackupRequestHandler:
                 self._superseded.discard(request_id)
                 await self._finish(request_id, DONE_CLOSED)
             raise
+        except Exception as err:  # noqa: BLE001 — letzter Fang (#211, C7)
+            # Das Backup war schon vor dem Neustart als verschlüsselt geprüft.
+            await self._fail_unexpected(request_id, err, manager, local_id, keep_backup_id=backup_id)
+
+    async def _finish_unreachable(self, request_id: str, err: BackupJobAborted) -> None:
+        """Eine Meldung kam nicht an: lokal als ``failed`` buchen, damit eine erneute
+        Zustellung mit ``failed`` beantwortet wird (#211)."""
+        _LOGGER.warning("Backup-Auftrag %s abgebrochen, Backend nicht erreichbar: %s", request_id, err)
+        await self._finish(request_id, DONE_FAILED,
+                           error=f"{ERROR_UPLOAD_FAILED}: {DETAIL_BACKEND_UNREACHABLE}")
+
+    async def _fail_unexpected(self, request_id: str, err: Exception, manager: Any,
+                               local_id: str | None, *, keep_backup_id: str | None) -> None:
+        """Letzter Fang (#211, C7): ``unexpected_error`` melden, den Auftrag abschließen und
+        aufräumen — ein unverschlüsseltes Backup geht, ein geprüftes bleibt (#201).
+
+        Scheitert auch das, bleibt es beim Log; den Auftrag beendet dann der Wächter des Backends."""
+        _LOGGER.error("Backup-Auftrag %s unerwartet abgebrochen", request_id, exc_info=err)
+        detail = _short(f"{type(err).__name__}: {err}".rstrip(": "))
+        try:
+            await self._report_failed(request_id, BackupJobFailed(ERROR_UNEXPECTED, detail))
+            await self._finish(request_id, DONE_FAILED, error=ERROR_UNEXPECTED)
+            if manager is not None and local_id is not None:
+                await self._prune_local(manager, local_id, keep_backup_id=keep_backup_id)
+        except Exception:  # noqa: BLE001 — der letzte Fang darf selbst nicht scheitern
+            _LOGGER.warning("Backup-Auftrag %s: Aufräumen nach dem Fehler gescheitert",
+                            request_id, exc_info=True)
 
     async def _local_backup(self, manager: Any, local_id: str, backup_id: str) -> Any | None:
         for backup in await manager.backup_agents[local_id].async_list_backups():
@@ -1011,6 +1118,26 @@ def _backup_timestamp(backup: Any) -> float:
         return datetime.fromisoformat(str(getattr(backup, "date", ""))).timestamp()
     except (TypeError, ValueError, OverflowError, OSError):
         return 0.0
+
+
+# Netzfehler, bei denen ein Aufruf wiederholt wird. ``RuntimeError`` wirft aiohttp mit
+# „Session is closed“, wenn die Integration beim Entladen die Session schließt (#211);
+# welche davon zählen, entscheidet ``_is_network_error``.
+_NETWORK_ERRORS = (aiohttp.ClientError, TimeoutError, RuntimeError)
+_SESSION_CLOSED = "Session is closed"
+
+
+def _is_network_error(err: BaseException) -> bool:
+    """``RuntimeError`` zählt nur mit der Meldung der geschlossenen Session als Netzfehler.
+    Jeder andere ist ein Programmierfehler und gehört in den letzten Fang (``unexpected_error``)."""
+    return not isinstance(err, RuntimeError) or str(err) == _SESSION_CLOSED
+
+
+def _transient(status: int, error: str) -> bool:
+    """Vorübergehende Antwort, die einen neuen Versuch lohnt: 5xx — und 404 ohne JSON-``error``.
+    Den liefert der Proxy, solange das Backend bei einem Deploy neu startet; ein 404 des
+    Backends selbst trägt immer ``error`` und bleibt endgültig (#211, C10)."""
+    return status >= 500 or (status == 404 and not error)
 
 
 def _retry_after(resp: Any) -> float:

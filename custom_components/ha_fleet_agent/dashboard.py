@@ -9,7 +9,7 @@ HA-Instanz des Endkunden automatisch ein eigenes Lovelace-Dashboard
 ``_DASHBOARD_TEXTS`` mehrsprachig hinterlegt (de/en/es/fr/hr — deckungsgleich mit
 den Sprachen der Fleet-Manager-Web-App). Seit 0.7.1 waehlt der Endkunde die Sprache **explizit im
 Config-Flow** — der Wert landet in ``entry.data[CONF_LANGUAGE]`` und wird
-ueber ``_lang_from_entry`` ausgelesen. Frueher (0.7.0) wurde stattdessen
+ueber ``language.lang_from_entry`` ausgelesen. Frueher (0.7.0) wurde stattdessen
 ``hass.config.language`` herangezogen, was Probleme machte (HA-Profile-Sprache
 pro User vs. System-Sprache; HAOS-Setup-Wizard setzt oft die falsche). Die
 explizite Wahl ist kanonisch; ``hass.config.language`` greift nur noch als
@@ -92,11 +92,11 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 
 from .const import (
-    CONF_LANGUAGE,
     DEFAULT_LANGUAGE,
     DOMAIN,
     SUPPORTED_LANGUAGES,
 )
+from .language import lang_from_entry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -600,51 +600,6 @@ def _texts(lang: str) -> dict[str, Any]:
     return _DASHBOARD_TEXTS.get(lang, _DASHBOARD_TEXTS[DEFAULT_LANGUAGE])
 
 
-def _resolve_language(hass: HomeAssistant) -> str:
-    """Liest die HA-Sprache und mappt sie auf eine unterstuetzte Plugin-Sprache.
-
-    ``hass.config.language`` kann ``"de"``, ``"de_DE"``, ``"en"``, ``"en_GB"``,
-    ``"es"``, ``"fr_FR"``, ``"hr"`` usw. sein — wir schneiden auf den
-    2-Buchstaben-Praefix und behalten ihn, wenn er zu ``SUPPORTED_LANGUAGES``
-    gehoert; alles andere faellt auf ``DEFAULT_LANGUAGE`` (``"en"``).
-
-    Wird seit Plugin 0.7.1 nur noch als **Fallback** verwendet: kanonische
-    Quelle ist die im Config-Flow gewaehlte Sprache (``entry.data[CONF_LANGUAGE]``,
-    siehe ``_lang_from_entry``). HA-Sprache greift nur, wenn das Feld im
-    ConfigEntry fehlt (0.7.0-Bestand).
-    """
-    raw = ""
-    try:
-        raw = getattr(hass.config, "language", "") or ""
-    except Exception:  # noqa: BLE001
-        _LOGGER.debug("hass.config.language nicht lesbar — nutze Default")
-    short = raw[:2].lower() if isinstance(raw, str) else ""
-    return short if short in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
-
-
-def _lang_from_entry(entry: ConfigEntry, hass: HomeAssistant) -> str:
-    """Liefert die Sprache fuer dieses ConfigEntry.
-
-    Prioritaet:
-    1. ``entry.data[CONF_LANGUAGE]`` — Endkunden-Wahl im Config-Flow
-       (kanonische Quelle ab 0.7.1).
-    2. ``_resolve_language(hass)`` — Fallback fuer 0.7.0-Bestandsinstallationen,
-       die das Feld noch nicht im ConfigEntry hatten.
-    3. ``DEFAULT_LANGUAGE`` — letzter Fallback (sollte nie greifen).
-
-    Defensiv: Unbekannte Werte in entry.data werden ignoriert, damit ein
-    manuell editierter Config-Entry das Plugin nicht crasht.
-    """
-    raw = ""
-    try:
-        raw = entry.data.get(CONF_LANGUAGE, "") or ""
-    except Exception:  # noqa: BLE001
-        raw = ""
-    if isinstance(raw, str) and raw in SUPPORTED_LANGUAGES:
-        return raw
-    return _resolve_language(hass)
-
-
 # --------------------------------------------------------- Karten-Builder
 
 
@@ -945,7 +900,7 @@ async def async_ensure_dashboard(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
     # 2. Frisch — Sprache aus dem ConfigEntry lesen (Endkunden-Wahl im Config-Flow).
     #    Fallback auf HA-Sprache fuer 0.7.0-Bestandsinstallationen.
-    lang = _lang_from_entry(entry, hass)
+    lang = lang_from_entry(entry, hass)
 
     # 2a. Fremd-Dashboard mit unserem url_path? Respektieren.
     if DASHBOARD_URL_PATH in dashboards:

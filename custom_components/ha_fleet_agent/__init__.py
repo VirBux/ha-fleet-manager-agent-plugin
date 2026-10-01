@@ -57,11 +57,12 @@ from .const import (
     REBUILD_BACKOFF_MAX_SECONDS,
     REBUILD_SETTLE_SECONDS,
 )
-from .backup_handler import BackupRequestHandler
+from .backup_handler import BackupRequestHandler, async_remove_store as async_remove_backup_store
 from .clear_logs_handler import ClearLogsHandler
-from .dashboard import _lang_from_entry, async_ensure_dashboard, async_remove_dashboard
+from .dashboard import async_ensure_dashboard, async_remove_dashboard
 from .device import build_device_info
 from .integrator_user import IntegratorUserManager
+from .language import lang_from_entry
 from .reconnect import TunnelReconnector
 from .remote_access import RemoteAccessManager, parse_iso_utc
 from .request_poller import RequestPoller
@@ -229,7 +230,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         backend_url=backend_url,
         api_key=api_key,
         integrator_user=integrator_user,
-        language=_lang_from_entry(entry, hass),
+        language=lang_from_entry(entry, hass),
     )
     await remote_access.async_load()
     # Erinnerung an eine dauerhafte Vorab-Freigabe (#167): täglicher Check.
@@ -340,7 +341,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         session=http_session,
         backend_url=backend_url,
         api_key=api_key,
-        language=_lang_from_entry(entry, hass),
+        language=lang_from_entry(entry, hass),
     )
     await backup_handler.async_setup()
     request_poller.register_handler("backup_create", backup_handler.handle)
@@ -655,15 +656,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Wird beim vollstaendigen Entfernen der Integration aufgerufen.
+    """Wird beim vollständigen Entfernen der Integration aufgerufen.
 
-    Loescht das Auto-Dashboard (REQUIREMENTS §4.6 / TODO #91). Bewusst NICHT
-    in async_unload_entry — sonst verschwindet das Dashboard auch bei jedem
-    Reload und Kunden-Anpassungen waeren weg.
+    Löscht das Auto-Dashboard (REQUIREMENTS §4.6 / TODO #91) und den
+    Backup-Auftragszustand (#211). Bewusst NICHT in async_unload_entry — sonst
+    verschwindet das Dashboard auch bei jedem Reload und Kunden-Anpassungen
+    wären weg.
     """
     try:
         await async_remove_dashboard(hass, entry)
     except Exception:  # noqa: BLE001
         _LOGGER.exception(
-            "Konnte Fernwartungs-Dashboard beim Entfernen nicht aufraeumen"
+            "Konnte Fernwartungs-Dashboard beim Entfernen nicht aufräumen"
         )
+    try:
+        await async_remove_backup_store(hass, entry.entry_id)
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("Konnte Backup-Auftragszustand beim Entfernen nicht aufräumen")
