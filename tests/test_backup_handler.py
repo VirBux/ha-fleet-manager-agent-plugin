@@ -579,9 +579,42 @@ async def test_busy_upload_slots_are_waited_out():
 
 
 @pytest.mark.asyncio
+async def test_backend_restart_during_upload_is_bridged():
+    # Deploy mit einer Backend-Instanz (#241): Der laufende Request reißt ab, danach liefert
+    # der Proxy 404 ohne JSON-error und 502, bis die neue Instanz healthy ist.
+    hass, backend = FakeHass(), FakeBackend()
+    backend.scripted.append(("PUT", "/content", FakeResponse(502)))
+    for _ in range(4):
+        backend.scripted.append(("PUT", "/content", FakeResponse(404)))
+    backend.scripted.append(("PUT", "/content", FakeResponse(502)))
+    content = _content(2500)
+    manager = FakeManager(content=content)
+    handler = _handler(hass, backend, manager)
+
+    await _deliver(handler, hass)
+
+    assert bytes(backend.received[REQUEST_ID]) == content
+    assert backend.completes
+    assert backend.reports[-1]["status"] != "failed"
+
+
+def test_chunk_retry_budget_covers_a_backend_restart():
+    # Die Pausen zwischen den Versuchen eines Stücks müssen einen Backend-Neustart
+    # überbrücken: Shutdown, Start und Healthcheck dauern zusammen bis etwa 60 s (#241).
+    # Aus const lesen — das Fixture oben nullt die Pausen nur im Modul backup_handler.
+    from ha_fleet_agent import const
+
+    pauses = [
+        const.BACKUP_CHUNK_BACKOFF_SECONDS[min(i, len(const.BACKUP_CHUNK_BACKOFF_SECONDS) - 1)]
+        for i in range(const.BACKUP_CHUNK_ATTEMPTS - 1)
+    ]
+    assert sum(pauses) >= 90
+
+
+@pytest.mark.asyncio
 async def test_persistent_network_errors_fail_the_request():
     hass, backend = FakeHass(), FakeBackend()
-    for _ in range(5):
+    for _ in range(backup_module.BACKUP_CHUNK_ATTEMPTS):
         backend.scripted.append(("PUT", "/content", FakeResponse(500)))
     manager = FakeManager(content=_content())
     handler = _handler(hass, backend, manager)

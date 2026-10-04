@@ -2,7 +2,7 @@
 
 DOMAIN = "ha_fleet_agent"
 NAME = "HA Fleet Manager Agent"
-VERSION = "1.15.1"
+VERSION = "1.15.2"
 
 # Config-Entry-Felder
 CONF_API_KEY = "api_key"
@@ -519,8 +519,10 @@ BACKUP_MAX_BYTES = 2 * 1024 * 1024 * 1024
 # Zeitlimit je Stück — knapp unter der Traefik-Grenze.
 BACKUP_CHUNK_TIMEOUT_SECONDS = 50
 # Versuche je Stück bei Netzfehler, Timeout oder 5xx, dazwischen diese Pausen.
-BACKUP_CHUNK_ATTEMPTS = 5
-BACKUP_CHUNK_BACKOFF_SECONDS = (1, 2, 5, 10)
+# Zusammen knapp 100 s: Solange ein Backend-Neustart dauert (Start plus Healthcheck,
+# der Proxy liefert so lange 404 oder 502), darf das Backup nicht scheitern (#241).
+BACKUP_CHUNK_ATTEMPTS = 8
+BACKUP_CHUNK_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 30)
 # Wartet das Backend wegen belegter Upload-Plätze (503), zählt das nicht als
 # Fehlversuch; nach so vielen Wartezeiten gibt das Plugin trotzdem auf.
 BACKUP_MAX_SLOT_WAITS = 60
