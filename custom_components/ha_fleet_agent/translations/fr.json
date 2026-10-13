@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Configurer HA Fleet Manager Agent",
-        "description": "Saisissez la clé API, le domaine de base et la langue du tableau de bord généré automatiquement. Vous trouverez la clé API dans le tableau de bord Fleet Manager, sous Paramètres → Agents.",
+        "description": "Saisissez la clé API, le domaine de base et la langue du tableau de bord généré automatiquement.\n\nLa clé API est la clé d'agent que Fleet Manager affiche une seule fois lorsque vous créez le client avec l'option « Activer la supervision » cochée (Clients → Nouveau client) ou, si vous l'avez créé sans cette option, lorsque vous activez la supervision pour la première fois.\n\nSi vous n'avez plus la clé, générez-en une nouvelle dans la liste des clients via l'icône de clé (Renouveler) pendant que la supervision est active ; l'ancienne clé cesse alors de fonctionner.",
         "data": {
           "api_key": "Clé API",
           "base_domain": "Domaine de base",

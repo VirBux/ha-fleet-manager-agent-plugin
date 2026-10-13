@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "HA Fleet Manager Agent einrichten",
-        "description": "Gib API-Key, Basis-Domain und die Sprache für das Auto-Dashboard ein. Den API-Key erhältst du im Fleet Manager Dashboard unter Einstellungen → Agenten.",
+        "description": "Gib API-Key, Basis-Domain und die Sprache für das Auto-Dashboard ein.\n\nDer API-Key ist der Agent-Key, den der Fleet Manager einmalig anzeigt, wenn du den Kunden mit Haken bei „Überwachung aktivieren“ anlegst (Kunden → Neuer Kunde) oder bei einem ohne Überwachung angelegten Kunden die Überwachung zum ersten Mal aktivierst.\n\nHast du den Key nicht mehr, erzeugst du bei aktiver Überwachung in der Kundenliste über das Schlüssel-Symbol (Rotieren) einen neuen; der alte gilt danach nicht mehr.",
         "data": {
           "api_key": "API-Key",
           "base_domain": "Basis-Domain",

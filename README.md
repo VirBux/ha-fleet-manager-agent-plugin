@@ -65,8 +65,11 @@ After installation, add the integration via the UI:
 1. **Settings → Devices & Services → Add Integration**.
 2. Search for **HA Fleet Manager Agent**.
 3. Enter:
-   - **API key** — at least 16 characters, found in the Fleet Manager dashboard under
-     **Settings → Agents**.
+   - **API key** — the agent key (at least 16 characters). Fleet Manager shows it once when you
+     create the customer with **Enable monitoring** ticked (**Customers → New customer**) or, for a
+     customer created without it, the first time you enable monitoring. If you no longer have the
+     key, generate a new one in the customer list with the key icon (**Rotate**) while monitoring
+     is active; the old key then stops working.
    - **Base domain** — your HA Fleet Manager domain, e.g. `ha-fleet-manager.com`. The
      backend and relay URLs are derived automatically (`api.<domain>`, `relay.<domain>`).
    - **Language** — Deutsch, English, Español, Français or Hrvatski for the auto-generated

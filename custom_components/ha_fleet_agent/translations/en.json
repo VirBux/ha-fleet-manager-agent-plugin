@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Set up HA Fleet Manager Agent",
-        "description": "Enter the API key, the base domain and the language for the auto-generated dashboard. You can find the API key in the Fleet Manager dashboard under Settings → Agents.",
+        "description": "Enter the API key, the base domain and the language for the auto-generated dashboard.\n\nThe API key is the agent key that Fleet Manager shows once when you create the customer with “Enable monitoring” ticked (Customers → New customer) or, for a customer created without it, the first time you enable monitoring.\n\nIf you no longer have the key, generate a new one in the customer list with the key icon (Rotate) while monitoring is active; the old key then stops working.",
         "data": {
           "api_key": "API key",
           "base_domain": "Base domain",

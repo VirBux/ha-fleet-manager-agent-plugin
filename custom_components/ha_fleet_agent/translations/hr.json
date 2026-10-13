@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Postavljanje HA Fleet Manager Agenta",
-        "description": "Unesite API ključ, osnovnu domenu i jezik za automatski generiranu nadzornu ploču. API ključ pronaći ćete u Fleet Manager nadzornoj ploči pod Postavke → Agenti.",
+        "description": "Unesite API ključ, osnovnu domenu i jezik za automatski generiranu nadzornu ploču.\n\nAPI ključ je Agent-Key koji Fleet Manager prikazuje samo jednom kada kreirate klijenta s označenom opcijom „Uključi nadzor“ (Klijenti → Novi klijent) ili, ako ste ga kreirali bez te opcije, kada prvi put uključite nadzor.\n\nAko više nemate ključ, novi možete generirati na popisu klijenata pomoću ikone ključa (Rotiraj) dok je nadzor uključen; stari ključ tada prestaje vrijediti.",
         "data": {
           "api_key": "API ključ",
           "base_domain": "Osnovna domena",
