@@ -3,8 +3,9 @@
 Modellierung gemäss REQUIREMENTS §4:
 
 - §4.2 — Standardablauf: Integrator stellt Anfrage (Betreff, Dauer, Grund) →
-  Endkunde sieht alles in einer Persistent Notification und bestätigt über
-  den Service `ha_fleet_agent.confirm_request`.
+  Endkunde sieht alles als Repair-Issue (Einstellungen → Reparaturen) und
+  nimmt die Anfrage im Repair-Flow an oder lehnt sie ab (`repairs.py`);
+  alternativ über den Service `ha_fleet_agent.confirm_request`.
 - §4.3 — Vorab-Freigabe: Endkunde legt im Voraus ein Zeitfenster (Gültigkeit)
   und eine maximale Sessiondauer fest. Innerhalb des Fensters genehmigt der
   Agent eingehende Anfragen automatisch und kappt deren Dauer auf das Maximum.
@@ -753,7 +754,7 @@ class RemoteAccessManager:
             await self._accept(request_id, subject, reason, duration_hours, auto=True)
             return
 
-        # §4.2 — Standardablauf: persistente Notification erzeugen
+        # §4.2 — Standardablauf: Repair-Issue anlegen
         await self._notify_user(request_id, subject, reason, duration_hours)
 
     async def confirm_request(
